@@ -3,6 +3,7 @@ package markprice
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"nyyu-market/internal/cache"
@@ -23,8 +24,7 @@ type Service struct {
 	logger     *logrus.Logger
 
 	// EMA state for funding basis
-	fundingBasisEMA map[string]decimal.Decimal // symbol -> EMA value
-	emaMu           map[string]*struct{}        // per-symbol mutexes
+	fundingBasisEMA sync.Map // symbol -> decimal.Decimal (thread-safe)
 }
 
 func NewService(
@@ -35,13 +35,12 @@ func NewService(
 	logger *logrus.Logger,
 ) *Service {
 	return &Service{
-		cache:           cache,
-		pubsub:          pubsub,
-		aggregator:      aggregator,
-		config:          config,
-		logger:          logger,
-		fundingBasisEMA: make(map[string]decimal.Decimal),
-		emaMu:           make(map[string]*struct{}),
+		cache:      cache,
+		pubsub:     pubsub,
+		aggregator: aggregator,
+		config:     config,
+		logger:     logger,
+		// fundingBasisEMA is sync.Map, no initialization needed
 	}
 }
 
@@ -82,19 +81,22 @@ func (s *Service) CalculateMarkPrice(ctx context.Context, symbol string) (*model
 	// Calculate funding basis: (Perpetual - Index)
 	fundingBasis := lastPrice.Sub(indexPrice)
 
-	// Get or initialize EMA for this symbol
-	if _, exists := s.fundingBasisEMA[symbol]; !exists {
-		s.fundingBasisEMA[symbol] = fundingBasis
+	// Get or initialize EMA for this symbol using sync.Map
+	previousEMAInterface, exists := s.fundingBasisEMA.LoadOrStore(symbol, fundingBasis)
+	var previousEMA decimal.Decimal
+	if exists {
+		previousEMA = previousEMAInterface.(decimal.Decimal)
+	} else {
+		previousEMA = fundingBasis
 	}
 
 	// Calculate EMA: EMA = (Current * α) + (Previous * (1 - α))
 	// α = 2 / (N + 1), where N = period
 	alpha := decimal.NewFromInt(2).Div(decimal.NewFromInt(int64(s.config.MarkPrice.EMAPeriod + 1)))
-	previousEMA := s.fundingBasisEMA[symbol]
 	ema := fundingBasis.Mul(alpha).Add(previousEMA.Mul(decimal.NewFromInt(1).Sub(alpha)))
 
 	// Store new EMA
-	s.fundingBasisEMA[symbol] = ema
+	s.fundingBasisEMA.Store(symbol, ema)
 
 	// Mark Price = Index Price + Funding Basis (EMA)
 	markPriceValue := indexPrice.Add(ema)

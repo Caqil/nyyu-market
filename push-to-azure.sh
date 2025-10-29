@@ -15,13 +15,25 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 echo -e "${BLUE}================================================${NC}"
-echo -e "${BLUE}  Deploy to Azure: market.nyyu.io${NC}"
+echo -e "${BLUE}  Nyyu Market - Azure Deployment${NC}"
 echo -e "${BLUE}================================================${NC}"
 echo ""
 
+# Ask for domain
+read -p "Enter your domain (e.g., market.nyyu.io): " DOMAIN
+
+if [[ -z "$DOMAIN" ]]; then
+    echo -e "${RED}❌ Domain is required${NC}"
+    exit 1
+fi
+
+echo ""
+echo -e "${GREEN}Deploying to: $DOMAIN${NC}"
+echo ""
+
 # Configuration
-SSH_KEY="$HOME/Downloads/market_key.pem"
-SERVER="azureuser@20.77.27.75"
+SSH_KEY="$HOME/Downloads/Azure-NYYU.pem"
+SERVER="azureuser@market.nyyu.io"
 REMOTE_DIR="/opt/nyyu-market"
 
 # Check if SSH key exists
@@ -200,11 +212,356 @@ ENDSSH
 echo -e "${GREEN}✅ Environment ready${NC}"
 
 ###############################################################################
-# Step 5: Deploy
+# Step 5: Setup Nginx
 ###############################################################################
 
 echo ""
-echo -e "${YELLOW}[5/5] Deploying application...${NC}"
+echo -e "${YELLOW}[5/7] Setting up Nginx...${NC}"
+
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" "DOMAIN=$DOMAIN" bash << 'ENDSSH'
+set -e
+
+# Get domain from environment
+DOMAIN=${DOMAIN}
+
+# Install Nginx if not present
+if ! command -v nginx &> /dev/null; then
+    echo "Installing Nginx..."
+    sudo apt update
+    sudo apt install -y nginx
+    echo "✅ Nginx installed"
+else
+    echo "✅ Nginx already installed"
+fi
+
+# Create Nginx configuration
+echo "Configuring Nginx for $DOMAIN..."
+sudo tee /etc/nginx/sites-available/nyyu-market > /dev/null <<EOF
+# HTTP API Upstream
+upstream nyyu_http_api {
+    server localhost:8080;
+    keepalive 32;
+}
+
+# gRPC API Upstream
+upstream nyyu_grpc_api {
+    server localhost:50051;
+    keepalive 32;
+}
+
+# HTTP Server
+server {
+    listen 80;
+    server_name $DOMAIN;
+
+    # HTTP API
+    location / {
+        proxy_pass http://nyyu_http_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+
+    # Health check
+    location /health {
+        proxy_pass http://nyyu_http_api/health;
+        access_log off;
+    }
+
+    access_log /var/log/nginx/nyyu_http_access.log;
+    error_log /var/log/nginx/nyyu_http_error.log;
+}
+
+# gRPC Server
+server {
+    listen 50051 http2;
+    server_name $DOMAIN;
+
+    location / {
+        grpc_pass grpc://nyyu_grpc_api;
+        error_page 502 = /error502grpc;
+    }
+
+    location = /error502grpc {
+        internal;
+        default_type application/grpc;
+        add_header grpc-status 14;
+        add_header content-length 0;
+        return 204;
+    }
+}
+EOF
+
+# Enable site
+sudo ln -sf /etc/nginx/sites-available/nyyu-market /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+
+# Test and reload Nginx
+sudo nginx -t
+sudo systemctl enable nginx
+sudo systemctl restart nginx
+
+echo "✅ Nginx configured"
+ENDSSH
+
+echo -e "${GREEN}✅ Nginx ready${NC}"
+
+###############################################################################
+# Step 6: Setup SSL
+###############################################################################
+
+echo ""
+echo -e "${YELLOW}[6/7] Setting up SSL...${NC}"
+echo ""
+echo "Choose SSL option:"
+echo "1) Cloudflare SSL (recommended - free, easy)"
+echo "2) Let's Encrypt (requires DNS pointing to server)"
+echo "3) Skip SSL setup"
+echo ""
+read -p "Select option [1-3]: " SSL_OPTION
+
+if [[ "$SSL_OPTION" == "1" ]]; then
+    echo ""
+    echo -e "${BLUE}Cloudflare SSL Certificate Setup${NC}"
+    echo ""
+
+    # Auto-detect certificates in certs/ folder
+    CERT_FILE=""
+    KEY_FILE=""
+
+    if [[ -f "certs/fullchain.pem" && -f "certs/privkey.pem" ]]; then
+        echo -e "${GREEN}✅ Found certificates in certs/ folder${NC}"
+        CERT_FILE="certs/fullchain.pem"
+        KEY_FILE="certs/privkey.pem"
+    else
+        echo "Certificate files not found in certs/ folder"
+        echo ""
+        read -p "Do you have Cloudflare Origin Certificate files? [Y/n]: " HAS_CERTS
+
+        if [[ ! $HAS_CERTS =~ ^[Nn]$ ]]; then
+            # Ask for certificate files location
+            read -p "Enter path to certificate file (.pem or .crt): " CERT_FILE
+            read -p "Enter path to private key file (.key): " KEY_FILE
+        fi
+    fi
+
+    if [[ -n "$CERT_FILE" && -n "$KEY_FILE" ]]; then
+        if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+            echo "Uploading certificates to server..."
+
+            # Create ssl directory and upload certificates
+            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" "sudo mkdir -p /etc/nginx/ssl"
+            scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$CERT_FILE" "$SERVER:/tmp/cloudflare.crt"
+            scp -i "$SSH_KEY" -o StrictHostKeyChecking=no "$KEY_FILE" "$SERVER:/tmp/cloudflare.key"
+            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" "DOMAIN=$DOMAIN" bash << 'ENDSSH'
+set -e
+DOMAIN=${DOMAIN}
+
+# Move certificates to nginx ssl directory
+sudo mv /tmp/cloudflare.crt /etc/nginx/ssl/$DOMAIN.crt
+sudo mv /tmp/cloudflare.key /etc/nginx/ssl/$DOMAIN.key
+sudo chmod 644 /etc/nginx/ssl/$DOMAIN.crt
+sudo chmod 600 /etc/nginx/ssl/$DOMAIN.key
+
+# Update Nginx config for HTTPS
+sudo tee /etc/nginx/sites-available/nyyu-market > /dev/null <<EOF
+# HTTP API Upstream
+upstream nyyu_http_api {
+    server localhost:8080;
+    keepalive 32;
+}
+
+# HTTP Server - Redirect to HTTPS
+server {
+    listen 80;
+    server_name $DOMAIN;
+    return 301 https://\$server_name\$request_uri;
+}
+
+# HTTPS Server
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+
+    # Cloudflare SSL Certificate
+    ssl_certificate /etc/nginx/ssl/$DOMAIN.crt;
+    ssl_certificate_key /etc/nginx/ssl/$DOMAIN.key;
+
+    # SSL Configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    # HTTP API
+    location / {
+        proxy_pass http://nyyu_http_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+
+    # Health check
+    location /health {
+        proxy_pass http://nyyu_http_api/health;
+        access_log off;
+    }
+
+    access_log /var/log/nginx/nyyu_https_access.log;
+    error_log /var/log/nginx/nyyu_https_error.log;
+}
+EOF
+
+# Reload Nginx
+sudo nginx -t && sudo systemctl reload nginx
+
+echo "✅ Cloudflare SSL certificates installed"
+ENDSSH
+
+            echo -e "${GREEN}✅ Cloudflare SSL configured${NC}"
+        else
+            echo -e "${RED}❌ Certificate files not found${NC}"
+            echo "Continuing without SSL..."
+        fi
+    else
+        echo ""
+        echo -e "${BLUE}To add SSL later:${NC}"
+        echo "1. Create Origin Certificate in Cloudflare → SSL/TLS → Origin Server"
+        echo "2. Save as fullchain.pem and privkey.pem in certs/ folder"
+        echo "3. Re-run this script (it will auto-detect the files)"
+    fi
+
+elif [[ "$SSL_OPTION" == "2" ]]; then
+    # Prompt for email
+    echo ""
+    read -p "Enter email for SSL notifications (or press Enter for admin@$DOMAIN): " SSL_EMAIL
+    if [[ -z "$SSL_EMAIL" ]]; then
+        SSL_EMAIL="admin@$DOMAIN"
+    fi
+
+    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" "DOMAIN=$DOMAIN SSL_EMAIL=$SSL_EMAIL" bash << 'ENDSSH'
+set -e
+
+# Get domain from environment
+DOMAIN=${DOMAIN}
+SSL_EMAIL=${SSL_EMAIL}
+
+# Install Certbot if not present
+if ! command -v certbot &> /dev/null; then
+    echo "Installing Certbot..."
+    sudo apt install -y certbot python3-certbot-nginx
+    echo "✅ Certbot installed"
+else
+    echo "✅ Certbot already installed"
+fi
+
+# Check if certificate already exists
+if [ -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]; then
+    echo "✅ SSL certificate already exists for $DOMAIN"
+else
+    echo "Requesting SSL certificate for $DOMAIN..."
+    echo "Using email: $SSL_EMAIL"
+
+    # Use standalone mode temporarily (stop nginx first)
+    sudo systemctl stop nginx
+
+    sudo certbot certonly \
+        --standalone \
+        -d $DOMAIN \
+        --non-interactive \
+        --agree-tos \
+        -m $SSL_EMAIL || {
+            echo "⚠️  SSL setup failed, continuing without SSL"
+            sudo systemctl start nginx
+            exit 0
+        }
+
+    # Update Nginx config with Let's Encrypt certificates
+    sudo tee /etc/nginx/sites-available/nyyu-market > /dev/null <<EOF
+# HTTP API Upstream
+upstream nyyu_http_api {
+    server localhost:8080;
+    keepalive 32;
+}
+
+# HTTP Server - Redirect to HTTPS
+server {
+    listen 80;
+    server_name $DOMAIN;
+    return 301 https://\\\$server_name\\\$request_uri;
+}
+
+# HTTPS Server
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+
+    # Let's Encrypt SSL Certificate
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+
+    # SSL Configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    # HTTP API
+    location / {
+        proxy_pass http://nyyu_http_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host \\\$host;
+        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\\$scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 30s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+
+    # Health check
+    location /health {
+        proxy_pass http://nyyu_http_api/health;
+        access_log off;
+    }
+
+    access_log /var/log/nginx/nyyu_https_access.log;
+    error_log /var/log/nginx/nyyu_https_error.log;
+}
+EOF
+
+    sudo systemctl start nginx
+
+    # Enable auto-renewal
+    sudo systemctl enable certbot.timer
+    sudo systemctl start certbot.timer
+
+    echo "✅ SSL certificate installed"
+fi
+ENDSSH
+else
+    echo "⏭️  Skipping SSL setup"
+fi
+
+echo -e "${GREEN}✅ SSL configuration complete${NC}"
+
+###############################################################################
+# Step 7: Deploy Application
+###############################################################################
+
+echo ""
+echo -e "${YELLOW}[7/7] Deploying application...${NC}"
 
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" bash << 'ENDSSH'
 set -e
@@ -253,9 +610,10 @@ echo -e "${GREEN}================================================${NC}"
 echo ""
 
 echo -e "${BLUE}Your API is deployed at:${NC}"
-echo "  • HTTP API: https://market.nyyu.io"
-echo "  • Health: https://market.nyyu.io/health"
-echo "  • Stats: https://market.nyyu.io/api/v1/stats"
+echo "  • HTTP API: https://$DOMAIN"
+echo "  • gRPC API: $DOMAIN:50051 (with TLS after SSL setup)"
+echo "  • Health: https://$DOMAIN/health"
+echo "  • Stats: https://$DOMAIN/api/v1/stats"
 echo ""
 
 echo -e "${BLUE}Useful commands:${NC}"

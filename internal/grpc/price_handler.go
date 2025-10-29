@@ -2,7 +2,8 @@ package grpc
 
 import (
 	"context"
-	"time"
+	"encoding/json"
+	"fmt"
 
 	"nyyu-market/internal/models"
 	pb "nyyu-market/proto/marketpb"
@@ -19,22 +20,11 @@ func (s *Server) GetPrice(ctx context.Context, req *pb.GetPriceRequest) (*pb.Pri
 		return nil, status.Error(codes.InvalidArgument, "symbol is required")
 	}
 
-	// TODO: Implement price service
-	// For now, return a mock price calculated from latest candle
-	candle, err := s.candleSvc.GetLatestCandle(ctx, req.Symbol, "1m", "", "spot")
+	// Get price from service
+	price, err := s.priceSvc.GetPrice(ctx, req.Symbol)
 	if err != nil {
-		return nil, toGRPCError(err)
-	}
-
-	if candle == nil {
-		return nil, status.Error(codes.NotFound, "price not found")
-	}
-
-	// Create price from candle
-	price := &models.Price{
-		Symbol:    req.Symbol,
-		LastPrice: candle.Close,
-		UpdatedAt: candle.CloseTime,
+		s.logger.WithError(err).Errorf("Failed to get price for %s", req.Symbol)
+		return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get price: %v", err))
 	}
 
 	return priceToProto(price), nil
@@ -42,31 +32,141 @@ func (s *Server) GetPrice(ctx context.Context, req *pb.GetPriceRequest) (*pb.Pri
 
 // GetPrices retrieves prices for multiple symbols
 func (s *Server) GetPrices(ctx context.Context, req *pb.GetPricesRequest) (*pb.GetPricesResponse, error) {
-	// TODO: Implement batch price retrieval
-	// For now, return empty response
+	symbols := req.Symbols
+
+	// If no symbols specified, get popular symbols from API
+	if len(symbols) == 0 {
+		popularSymbols, err := s.symbolFetcher.GetPopularSymbols(ctx, 10)
+		if err != nil {
+			s.logger.WithError(err).Warn("Failed to fetch popular symbols, using defaults")
+			// Fallback to defaults
+			symbols = []string{
+				"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+				"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
+			}
+		} else {
+			symbols = popularSymbols
+		}
+	}
+
+	prices := make([]*pb.Price, 0, len(symbols))
+
+	// Get prices concurrently
+	type result struct {
+		price *pb.Price
+		err   error
+	}
+	results := make(chan result, len(symbols))
+
+	for _, symbol := range symbols {
+		go func(sym string) {
+			p, err := s.priceSvc.GetPrice(ctx, sym)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{price: priceToProto(p)}
+		}(symbol)
+	}
+
+	// Collect results
+	for i := 0; i < len(symbols); i++ {
+		res := <-results
+		if res.err == nil && res.price != nil {
+			prices = append(prices, res.price)
+		}
+	}
+
 	return &pb.GetPricesResponse{
-		Prices: []*pb.Price{},
+		Prices: prices,
 	}, nil
 }
 
 // SubscribePrices streams real-time price updates
 func (s *Server) SubscribePrices(req *pb.SubscribePricesRequest, stream pb.MarketService_SubscribePricesServer) error {
-	s.logger.Info("Client subscribed to prices")
+	symbols := req.Symbols
 
-	// TODO: Implement Redis pub/sub subscription for prices
-	// For now, poll every 1 second
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	// If no symbols specified, get popular symbols from API
+	if len(symbols) == 0 {
+		ctx := stream.Context()
+		popularSymbols, err := s.symbolFetcher.GetPopularSymbols(ctx, 10)
+		if err != nil {
+			s.logger.WithError(err).Warn("Failed to fetch popular symbols, using defaults")
+			// Fallback to defaults
+			symbols = []string{
+				"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+				"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
+			}
+		} else {
+			symbols = popularSymbols
+		}
+	}
+
+	s.logger.Infof("Client subscribed to prices for %d symbols", len(symbols))
+
+	ctx := stream.Context()
+
+	// Subscribe to Redis channels for all requested symbols
+	channels := make([]string, len(symbols))
+	for i, symbol := range symbols {
+		channels[i] = "nyyu:market:price:" + symbol
+	}
+
+	pubsub := s.redisClient.Subscribe(ctx, channels...)
+	defer pubsub.Close()
+
+	// Wait for confirmation that subscription is created
+	if _, err := pubsub.Receive(ctx); err != nil {
+		s.logger.WithError(err).Error("Failed to subscribe to price channels")
+		return status.Error(codes.Internal, "failed to subscribe to prices")
+	}
+
+	// Get initial prices for all symbols and send them
+	for _, symbol := range symbols {
+		go func(sym string) {
+			p, err := s.priceSvc.GetPrice(ctx, sym)
+			if err == nil && p != nil {
+				update := &pb.PriceUpdate{
+					Price:     priceToProto(p),
+					Timestamp: timestamppb.Now(),
+				}
+				if err := stream.Send(update); err != nil {
+					s.logger.WithError(err).Debug("Failed to send initial price")
+				}
+			}
+		}(symbol)
+	}
+
+	// Listen for updates
+	ch := pubsub.Channel()
 
 	for {
 		select {
-		case <-stream.Context().Done():
+		case <-ctx.Done():
 			s.logger.Info("Client unsubscribed from prices")
 			return nil
 
-		case <-ticker.C:
-			// TODO: Send actual price updates
-			// For now, just keep connection alive
+		case msg := <-ch:
+			if msg == nil {
+				continue
+			}
+
+			// Unmarshal price update
+			var price models.Price
+			if err := json.Unmarshal([]byte(msg.Payload), &price); err != nil {
+				s.logger.WithError(err).Warn("Failed to unmarshal price update")
+				continue
+			}
+
+			// Send to client
+			update := &pb.PriceUpdate{
+				Price:     priceToProto(&price),
+				Timestamp: timestamppb.Now(),
+			}
+			if err := stream.Send(update); err != nil {
+				s.logger.WithError(err).Debug("Failed to send price update")
+				return err
+			}
 		}
 	}
 }

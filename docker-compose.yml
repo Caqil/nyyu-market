@@ -48,8 +48,8 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "50051:50051"  # gRPC
-      - "8080:8080"    # HTTP
+      - "127.0.0.1:8080:8080"    # HTTP (localhost only - Nginx proxies)
+      - "2053:50051"             # gRPC (public on Cloudflare-compatible port)
     environment:
       - SERVER_PORT=50051
       - HTTP_PORT=8080

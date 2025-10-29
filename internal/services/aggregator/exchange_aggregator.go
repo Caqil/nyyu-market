@@ -84,7 +84,10 @@ type ExchangeAggregator struct {
 	batchTicker     *time.Ticker
 
 	// Rate limiters
-	rateLimiters map[string]*rate.Limiter
+	rateLimiters    map[string]*rate.Limiter
+	rateLimitMgr    *RateLimiterManager
+	subBatchers     map[string]*SubscriptionBatcher
+	subBatchersMu   sync.Mutex
 
 	// ⚡ IN-MEMORY AGGREGATION: Collect candles from all exchanges before writing
 	// Map structure: symbol -> interval -> openTime -> exchange -> candle
@@ -123,7 +126,18 @@ func NewExchangeAggregator(
 		{Name: "Gate.io", WSUrl: "wss://api.gateio.ws/ws/v4/", IsEnabled: cfg.Exchange.EnableGateIO, lastUpdate: now},
 	}
 
-	return &ExchangeAggregator{
+	// Initialize rate limiter manager
+	rateLimitMgr := NewRateLimiterManager()
+
+	// Register rate limiters for each exchange (conservative limits for production)
+	rateLimitMgr.RegisterExchange("Binance", 4.5, 10)   // 4.5 req/sec, burst 10
+	rateLimitMgr.RegisterExchange("Kraken", 10, 20)     // 10 req/sec, burst 20
+	rateLimitMgr.RegisterExchange("Coinbase", 8, 15)    // 8 req/sec, burst 15
+	rateLimitMgr.RegisterExchange("Bybit", 50, 100)     // 50 req/sec, burst 100
+	rateLimitMgr.RegisterExchange("OKX", 3, 5)          // 3 req/sec, burst 5 (OKX is strict)
+	rateLimitMgr.RegisterExchange("Gate.io", 30, 50)    // 30 req/sec, burst 50
+
+	agg := &ExchangeAggregator{
 		config:          cfg,
 		candleSvc:       candleSvc,
 		pubsub:          pubsub,
@@ -140,12 +154,30 @@ func NewExchangeAggregator(
 			"OKX":      rate.NewLimiter(rate.Limit(3), 5),
 			"Gate.io":  rate.NewLimiter(rate.Limit(30), 50),
 		},
+		rateLimitMgr:          rateLimitMgr,
+		subBatchers:           make(map[string]*SubscriptionBatcher),
 		pendingCandles:        make(map[string]map[string]map[int64]map[string]*models.Candle),
 		scheduledAggregations: make(map[string]map[string]map[int64]bool),
 		stopChan:              make(chan struct{}),
 		reconnectChan:         make(chan struct{}, 10), // Buffered for all exchanges
 		lastLogTime:           time.Now(),
 	}
+
+	// Initialize subscription batchers for each exchange
+	for _, ex := range exchanges {
+		if ex.IsEnabled {
+			batcher := NewSubscriptionBatcher(
+				2*time.Second, // Batch subscriptions for 2 seconds
+				50,            // Max 50 subscriptions per batch
+				func(reqs []*SubscriptionRequest) {
+					agg.processBatchedSubscriptions(reqs)
+				},
+			)
+			agg.subBatchers[ex.Name] = batcher
+		}
+	}
+
+	return agg
 }
 
 // Start initializes all exchange connections
@@ -163,6 +195,12 @@ func (a *ExchangeAggregator) Start(ctx context.Context) error {
 		go a.batchWriterWorker(ctx, i)
 	}
 
+	// Start subscription batchers for each exchange
+	for name, batcher := range a.subBatchers {
+		go batcher.Start(ctx)
+		a.logger.Infof("Started subscription batcher for %s", name)
+	}
+
 	// Start exchange connections
 	for _, ex := range a.exchanges {
 		if ex.IsEnabled {
@@ -175,6 +213,9 @@ func (a *ExchangeAggregator) Start(ctx context.Context) error {
 
 	// Start price aggregation monitor
 	go a.monitorPriceAggregation(ctx)
+
+	// Start rate limiter stats monitor
+	go a.monitorRateLimiters(ctx)
 
 	a.logger.Info("Exchange aggregator started successfully")
 	return nil
@@ -307,6 +348,20 @@ func (a *ExchangeAggregator) connectExchange(ctx context.Context, ex *Exchange) 
 	ex.lastUpdate = time.Now()
 	ex.failureCount = 0
 
+	// Get rate limiter for this exchange
+	limiter, err := a.rateLimitMgr.GetLimiter(ex.Name)
+	if err != nil {
+		return fmt.Errorf("rate limiter not found for %s: %w", ex.Name, err)
+	}
+
+	// Wait for rate limiter before subscribing
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if err := limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("rate limit wait failed for %s: %w", ex.Name, err)
+	}
+
 	// Subscribe to streams based on activeStreams and exchange
 	var subErr error
 	switch ex.Name {
@@ -325,9 +380,11 @@ func (a *ExchangeAggregator) connectExchange(ctx context.Context, ex *Exchange) 
 	}
 
 	if subErr != nil {
+		limiter.RecordRateLimitHit()
 		return fmt.Errorf("failed to subscribe %s: %w", ex.Name, subErr)
 	}
 
+	limiter.RecordSuccess()
 	a.logger.Infof("%s connected successfully", ex.Name)
 	return nil
 }
@@ -773,14 +830,196 @@ func (a *ExchangeAggregator) GetExchangeStats() map[string]map[string]interface{
 
 	for _, ex := range a.exchanges {
 		ex.mu.RLock()
-		stats[ex.Name] = map[string]interface{}{
+		exStats := map[string]interface{}{
 			"is_healthy":  ex.isHealthy,
 			"msg_count":   ex.msgCount,
 			"error_count": ex.errorCount,
 			"last_update": ex.lastUpdate,
 		}
 		ex.mu.RUnlock()
+
+		// Add rate limiter stats
+		if limiter, err := a.rateLimitMgr.GetLimiter(ex.Name); err == nil {
+			rateLimitStats := limiter.GetStats()
+			for k, v := range rateLimitStats {
+				exStats[k] = v
+			}
+		}
+
+		stats[ex.Name] = exStats
 	}
 
 	return stats
+}
+
+// processBatchedSubscriptions processes batched subscription requests
+func (a *ExchangeAggregator) processBatchedSubscriptions(reqs []*SubscriptionRequest) {
+	if len(reqs) == 0 {
+		return
+	}
+
+	// Group by exchange
+	byExchange := make(map[string][]*SubscriptionRequest)
+	for _, req := range reqs {
+		byExchange[req.Exchange] = append(byExchange[req.Exchange], req)
+	}
+
+	// Process each exchange's subscriptions
+	for exchange, exchangeReqs := range byExchange {
+		// Wait for rate limiter
+		limiter, err := a.rateLimitMgr.GetLimiter(exchange)
+		if err != nil {
+			a.logger.WithError(err).Warnf("Rate limiter not found for %s", exchange)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := limiter.Wait(ctx); err != nil {
+			cancel()
+			a.logger.WithError(err).Warnf("Rate limit wait failed for %s", exchange)
+			limiter.RecordRateLimitHit()
+			continue
+		}
+		cancel()
+
+		// Find the exchange
+		var ex *Exchange
+		for _, e := range a.exchanges {
+			if e.Name == exchange {
+				ex = e
+				break
+			}
+		}
+
+		if ex == nil || ex.conn == nil {
+			continue
+		}
+
+		// Subscribe based on exchange
+		var subErr error
+		switch exchange {
+		case "Binance":
+			subErr = a.subscribeBinanceWithLimiter(ex, limiter)
+		case "Kraken":
+			subErr = a.subscribeKrakenWithLimiter(ex, limiter)
+		case "Coinbase":
+			subErr = a.subscribeCoinbaseWithLimiter(ex, limiter)
+		case "Bybit":
+			subErr = a.subscribeBybitWithLimiter(ex, limiter)
+		case "OKX":
+			subErr = a.subscribeOKXWithLimiter(ex, limiter)
+		case "Gate.io":
+			subErr = a.subscribeGateIOWithLimiter(ex, limiter)
+		}
+
+		if subErr != nil {
+			a.logger.WithError(subErr).Warnf("Failed to subscribe to %s", exchange)
+			limiter.RecordRateLimitHit()
+
+			// Call error callbacks
+			for _, req := range exchangeReqs {
+				if req.Callback != nil {
+					req.Callback(subErr)
+				}
+			}
+		} else {
+			limiter.RecordSuccess()
+
+			// Call success callbacks
+			for _, req := range exchangeReqs {
+				if req.Callback != nil {
+					req.Callback(nil)
+				}
+			}
+		}
+	}
+}
+
+// monitorRateLimiters monitors rate limiter statistics
+func (a *ExchangeAggregator) monitorRateLimiters(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.stopChan:
+			return
+		case <-ticker.C:
+			a.logger.Info("Rate Limiter Stats:")
+			for _, ex := range a.exchanges {
+				if !ex.IsEnabled {
+					continue
+				}
+
+				limiter, err := a.rateLimitMgr.GetLimiter(ex.Name)
+				if err != nil {
+					continue
+				}
+
+				stats := limiter.GetStats()
+				a.logger.Infof("  %s: requests=%v, rate_limit_hits=%v, backoff=%vms, queue=%v",
+					ex.Name,
+					stats["request_count"],
+					stats["rate_limit_hits"],
+					stats["current_backoff_ms"],
+					stats["queue_size"],
+				)
+			}
+		}
+	}
+}
+
+// subscribeBinanceWithLimiter subscribes to Binance with rate limit enforcement
+func (a *ExchangeAggregator) subscribeBinanceWithLimiter(ex *Exchange, limiter *ExchangeRateLimiter) error {
+	// Check rate limit before subscribing
+	if !limiter.Allow() {
+		return fmt.Errorf("rate limit exceeded for %s", ex.Name)
+	}
+
+	return a.subscribeBinance(ex)
+}
+
+// subscribeKrakenWithLimiter subscribes to Kraken with rate limit enforcement
+func (a *ExchangeAggregator) subscribeKrakenWithLimiter(ex *Exchange, limiter *ExchangeRateLimiter) error {
+	if !limiter.Allow() {
+		return fmt.Errorf("rate limit exceeded for %s", ex.Name)
+	}
+
+	return a.subscribeKraken(ex)
+}
+
+// subscribeCoinbaseWithLimiter subscribes to Coinbase with rate limit enforcement
+func (a *ExchangeAggregator) subscribeCoinbaseWithLimiter(ex *Exchange, limiter *ExchangeRateLimiter) error {
+	if !limiter.Allow() {
+		return fmt.Errorf("rate limit exceeded for %s", ex.Name)
+	}
+
+	return a.subscribeCoinbase(ex)
+}
+
+// subscribeBybitWithLimiter subscribes to Bybit with rate limit enforcement
+func (a *ExchangeAggregator) subscribeBybitWithLimiter(ex *Exchange, limiter *ExchangeRateLimiter) error {
+	if !limiter.Allow() {
+		return fmt.Errorf("rate limit exceeded for %s", ex.Name)
+	}
+
+	return a.subscribeBybit(ex)
+}
+
+// subscribeOKXWithLimiter subscribes to OKX with rate limit enforcement
+func (a *ExchangeAggregator) subscribeOKXWithLimiter(ex *Exchange, limiter *ExchangeRateLimiter) error {
+	if !limiter.Allow() {
+		return fmt.Errorf("rate limit exceeded for %s", ex.Name)
+	}
+
+	return a.subscribeOKX(ex)
+}
+
+// subscribeGateIOWithLimiter subscribes to Gate.io with rate limit enforcement
+func (a *ExchangeAggregator) subscribeGateIOWithLimiter(ex *Exchange, limiter *ExchangeRateLimiter) error {
+	if !limiter.Allow() {
+		return fmt.Errorf("rate limit exceeded for %s", ex.Name)
+	}
+
+	return a.subscribeGateIO(ex)
 }

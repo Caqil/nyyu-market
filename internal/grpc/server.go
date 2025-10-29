@@ -8,8 +8,12 @@ import (
 
 	"nyyu-market/internal/config"
 	candleService "nyyu-market/internal/services/candle"
+	markpriceService "nyyu-market/internal/services/markprice"
+	priceService "nyyu-market/internal/services/price"
+	"nyyu-market/internal/services/symbols"
 	pb "nyyu-market/proto/marketpb"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -18,23 +22,35 @@ import (
 
 type Server struct {
 	pb.UnimplementedMarketServiceServer
-	config      *config.Config
-	candleSvc   *candleService.Service
-	logger      *logrus.Logger
-	grpcServer  *grpc.Server
-	startTime   time.Time
+	config        *config.Config
+	candleSvc     *candleService.Service
+	priceSvc      *priceService.Service
+	markPriceSvc  *markpriceService.Service
+	symbolFetcher *symbols.SymbolFetcher
+	redisClient   *redis.Client
+	logger        *logrus.Logger
+	grpcServer    *grpc.Server
+	startTime     time.Time
 }
 
 func NewServer(
 	cfg *config.Config,
 	candleSvc *candleService.Service,
+	priceSvc *priceService.Service,
+	markPriceSvc *markpriceService.Service,
+	symbolFetcher *symbols.SymbolFetcher,
+	redisClient *redis.Client,
 	logger *logrus.Logger,
 ) *Server {
 	return &Server{
-		config:     cfg,
-		candleSvc:  candleSvc,
-		logger:     logger,
-		startTime:  time.Now(),
+		config:        cfg,
+		candleSvc:     candleSvc,
+		priceSvc:      priceSvc,
+		markPriceSvc:  markPriceSvc,
+		symbolFetcher: symbolFetcher,
+		redisClient:   redisClient,
+		logger:        logger,
+		startTime:     time.Now(),
 	}
 }
 
