@@ -10,14 +10,18 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy source code
-COPY cmd cmd
-COPY internal internal
-COPY proto proto
-COPY migrations migrations
+# Copy all source code
+COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o nyyu-market ./cmd/server/main.go
+# Debug: Show what files we have
+RUN echo "=== Working directory ===" && pwd && \
+    echo "=== Listing current dir ===" && ls -la && \
+    echo "=== Checking cmd directory ===" && ls -la cmd/ && \
+    echo "=== Checking cmd/server ===" && ls -la cmd/server/ && \
+    echo "=== Checking for main.go ===" && find . -name "main.go"
+
+# Build the application using module path
+RUN CGO_ENABLED=0 GOOS=linux go build -o nyyu-market ./cmd/server
 
 # Final stage
 FROM alpine:latest
