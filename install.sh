@@ -479,8 +479,8 @@ update_docker_compose() {
     print_header "Updating docker-compose.yml with Passwords"
 
     # Update docker-compose.yml with generated passwords
-    sed -i.bak "s/CLICKHOUSE_PASSWORD=/CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}/g" docker-compose.yml
-    sed -i.bak "s/REDIS_PASSWORD=/REDIS_PASSWORD=${REDIS_PASSWORD}/g" docker-compose.yml
+    sed -i.bak "s|CLICKHOUSE_PASSWORD=|CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}|g" docker-compose.yml
+    sed -i.bak "s|REDIS_PASSWORD=|REDIS_PASSWORD=${REDIS_PASSWORD}|g" docker-compose.yml
 
     print_success "docker-compose.yml updated with secure passwords"
 }
