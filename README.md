@@ -1,16 +1,23 @@
-# Nyyu Market Service
+# Nyyu Market - Cryptocurrency Market Data Aggregator
 
-High-performance candle, kline, and price data service optimized for ultra-low latency market data delivery.
+Real-time cryptocurrency market data aggregation service supporting 6 major exchanges.
 
 ## Features
 
-- **Multi-Exchange WebSocket Aggregation**: Real-time candle data from 6+ exchanges
-- **ClickHouse Storage**: Sub-5ms query performance for OHLCV data
-- **gRPC API**: High-performance RPC for queries
-- **Redis Pub/Sub**: Real-time streaming to clients
-- **Mark Price Calculation**: Binance-style mark price for futures
-- **Optimized Caching**: Multi-layer caching strategy
-- **Circuit Breaker**: Automatic exchange reconnection
+- ✅ **Multi-Exchange Support**: Binance, Kraken, Coinbase, Bybit, OKX, Gate.io
+- ✅ **Real-time Data**: WebSocket connections to all exchanges
+- ✅ **Data Aggregation**: Combines candles from multiple exchanges
+- ✅ **High Performance**: In-memory aggregation, ClickHouse storage
+- ✅ **Dual API**: Both gRPC and HTTP REST APIs
+- ✅ **Production Ready**: Docker-based deployment with auto-restart
+
+## Tech Stack
+
+- **Language**: Go 1.24
+- **Database**: ClickHouse (time-series data)
+- **Cache**: Redis (pub/sub & caching)
+- **APIs**: gRPC + HTTP REST
+- **Deployment**: Docker Compose
 
 ## Architecture
 
@@ -61,145 +68,117 @@ High-performance candle, kline, and price data service optimized for ultra-low l
 - **WebSocket Updates**: Real-time (sub-100ms)
 - **gRPC Latency**: < 10ms (average)
 
-## Quick Start
+---
+
+## Quick Deployment to Azure
 
 ### Prerequisites
 
-- Go 1.22+
-- ClickHouse (separate database for nyyu-market)
-- Redis 6+
+- Go 1.24+ (on your local machine)
+- Azure server with SSH access
+- SSH key: `~/Downloads/Azure-NYYU.pem`
 
-### Installation
+### Deploy
 
-```bash
-# Clone or navigate to the project
-cd nyyu-market
-
-# Copy environment file
-cp .env.example .env
-
-# Edit configuration
-nano .env
-
-# Install dependencies
-go mod download
-
-# Run migrations
-go run cmd/migrate/main.go up
-
-# Start the server
-go run cmd/server/main.go
-```
-
-### Docker Deployment
+Run this script on your **local machine** (Mac):
 
 ```bash
-# Build and start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-
-# Stop services
-docker-compose down
+./push-to-azure.sh
 ```
 
-## API Documentation
+**What it does:**
+1. ✅ Builds the binary for Linux (on your Mac - fast!)
+2. ✅ Uploads binary and config files to Azure server
+3. ✅ Builds Docker image (no compilation on server)
+4. ✅ Starts all services (ClickHouse, Redis, API)
 
-### gRPC Endpoints
+**Deploy time:** ~2-3 minutes
 
-#### GetCandles
-Get historical candles for a symbol and interval.
+---
 
-```protobuf
-rpc GetCandles(GetCandlesRequest) returns (GetCandlesResponse);
+## Server Configuration
+
+**Domain:** market.nyyu.io
+**Server:** nyyu-market.uksouth.cloudapp.azure.com
+**User:** azureuser
+
+### Services
+
+| Service | Port | Access |
+|---------|------|--------|
+| HTTP API | 8080 | Via Nginx (https://market.nyyu.io) |
+| gRPC API | 50051 | Via Nginx (market.nyyu.io:443) |
+| ClickHouse | 9000 | Internal only (127.0.0.1) |
+| Redis | 6379 | Internal only (127.0.0.1) |
+
+---
+
+## API Endpoints
+
+### HTTP API
+
+**Health Check:**
+```bash
+curl https://market.nyyu.io/health
 ```
 
-**Request:**
-```json
-{
-  "symbol": "BTCUSDT",
-  "interval": "1m",
-  "limit": 100,
-  "start_time": 1234567890,
-  "end_time": 1234567999
-}
+**Get Stats:**
+```bash
+curl https://market.nyyu.io/api/v1/stats
 ```
 
-**Response:**
-```json
-{
-  "candles": [
-    {
-      "symbol": "BTCUSDT",
-      "interval": "1m",
-      "open_time": 1234567890000,
-      "close_time": 1234567899999,
-      "open": "50000.00",
-      "high": "50100.00",
-      "low": "49900.00",
-      "close": "50050.00",
-      "volume": "123.45",
-      "quote_volume": "6172500.00",
-      "trade_count": 1234,
-      "is_closed": true
-    }
-  ]
-}
+**Get Latest Candle:**
+```bash
+curl https://market.nyyu.io/api/v1/candles/latest?symbol=BTCUSDT&interval=1m&source=binance
 ```
 
-#### GetPrice
-Get current price for a symbol.
-
-```protobuf
-rpc GetPrice(GetPriceRequest) returns (GetPriceResponse);
+**Get Aggregated Candle:**
+```bash
+curl https://market.nyyu.io/api/v1/candles/latest?symbol=BTCUSDT&interval=1m&source=aggregated
 ```
 
-#### GetMarkPrice
-Get mark price for futures symbol.
+### gRPC API
 
-```protobuf
-rpc GetMarkPrice(GetMarkPriceRequest) returns (GetMarkPriceResponse);
+Use **Postman** or **grpcurl**:
+
+**Server:** market.nyyu.io:443
+**Proto file:** `proto/market.proto`
+**Enable TLS:** Yes
+
+---
+
+## Management
+
+### View Logs
+
+```bash
+ssh -i ~/Downloads/Azure-NYYU.pem azureuser@market.nyyu.io
+cd /opt/nyyu-market
+docker compose logs -f
 ```
 
-#### SubscribeCandles
-Real-time candle updates via streaming.
+### Check Status
 
-```protobuf
-rpc SubscribeCandles(SubscribeCandlesRequest) returns (stream CandleUpdate);
-```
-
-### REST Endpoints
-
-#### Health Check
-```
-GET /health
+```bash
+ssh -i ~/Downloads/Azure-NYYU.pem azureuser@market.nyyu.io
+cd /opt/nyyu-market
+docker compose ps
 ```
 
-#### Get Candles
-```
-GET /api/v1/candles/:symbol?interval=1m&limit=100
+### Restart Service
+
+```bash
+ssh -i ~/Downloads/Azure-NYYU.pem azureuser@market.nyyu.io
+cd /opt/nyyu-market
+docker compose restart
 ```
 
-#### Get Price
-```
-GET /api/v1/price/:symbol
-```
+### Update Deployment
 
-#### Get Mark Price
-```
-GET /api/v1/mark-price/:symbol
-```
+Just run the deployment script again:
 
-### Redis Pub/Sub Channels
-
-Subscribe to real-time updates:
-
-```
-nyyu:market:candle:{symbol}:{interval}
-nyyu:market:price:{symbol}
-nyyu:market:markprice:{symbol}
-nyyu:market:ticker:all
+```bash
+./push-to-azure.sh
 ```
 
 ## Configuration
