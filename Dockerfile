@@ -8,13 +8,16 @@ WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+RUN echo "Downloading Go modules..." && go mod download && echo "Download complete!"
 
 # Copy all source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o nyyu-market ./cmd/server
+# Build the application with progress
+RUN echo "Starting build..." && \
+    CGO_ENABLED=0 GOOS=linux go build -v -ldflags="-w -s" -o nyyu-market ./cmd/server && \
+    echo "Build complete!" && \
+    ls -lh nyyu-market
 
 # Final stage
 FROM alpine:latest
