@@ -46,8 +46,8 @@ func (s *Server) Start() error {
 
 	// Create gRPC server with options
 	opts := []grpc.ServerOption{
-		grpc.MaxRecvMsgSize(10 * 1024 * 1024), // 10MB
-		grpc.MaxSendMsgSize(10 * 1024 * 1024), // 10MB
+		grpc.MaxRecvMsgSize(100 * 1024 * 1024), // 100MB
+		grpc.MaxSendMsgSize(100 * 1024 * 1024), // 100MB
 		grpc.UnaryInterceptor(s.unaryInterceptor),
 		grpc.StreamInterceptor(s.streamInterceptor),
 	}
