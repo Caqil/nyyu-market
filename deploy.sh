@@ -211,15 +211,15 @@ EOF
 fi
 
 ###############################################################################
-# Step 5: Pull Docker Image
+# Step 5: Build Docker Image
 ###############################################################################
 
-print_header "Step 5: Pulling Docker Image"
+print_header "Step 5: Building Docker Image"
 
-print_info "Pulling latest image from GitHub Container Registry..."
-docker pull ghcr.io/caqil/nyyu-market:latest
+print_info "Building Docker image (this may take a few minutes)..."
+docker compose build
 
-print_success "Docker image pulled"
+print_success "Docker image built"
 
 ###############################################################################
 # Step 6: Configure Firewall
@@ -350,11 +350,11 @@ print_header "Step 9: Starting Services"
 cd "$PROJECT_DIR"
 
 # Stop existing containers
-docker compose -f docker-compose.prod.yml down 2>/dev/null || true
+docker compose down 2>/dev/null || true
 
 # Start services
 print_info "Starting Docker containers..."
-docker compose -f docker-compose.prod.yml up -d
+docker compose up -d
 
 print_success "Services started"
 
@@ -368,7 +368,7 @@ print_info "Waiting for services to be healthy..."
 sleep 15
 
 # Check container status
-docker compose -f docker-compose.prod.yml ps
+docker compose ps
 
 # Test health endpoint
 print_info "Testing health endpoint..."
@@ -380,7 +380,7 @@ if [[ $HEALTH_RESPONSE == *"healthy"* ]]; then
     echo "$HEALTH_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$HEALTH_RESPONSE"
 else
     print_warning "Health check pending, service might still be starting..."
-    print_info "Check logs with: docker compose -f docker-compose.prod.yml logs -f"
+    print_info "Check logs with: docker compose logs -f"
 fi
 
 ###############################################################################
@@ -399,8 +399,8 @@ After=docker.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$PROJECT_DIR
-ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml up -d
-ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml down
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=0
 
 [Install]
@@ -438,18 +438,18 @@ fi
 
 echo ""
 echo -e "${BLUE}=== Management Commands ===${NC}"
-echo "View logs:     docker compose -f docker-compose.prod.yml logs -f"
-echo "Restart:       docker compose -f docker-compose.prod.yml restart"
-echo "Stop:          docker compose -f docker-compose.prod.yml down"
-echo "Start:         docker compose -f docker-compose.prod.yml up -d"
-echo "Status:        docker compose -f docker-compose.prod.yml ps"
+echo "View logs:     docker compose logs -f"
+echo "Restart:       docker compose restart"
+echo "Stop:          docker compose down"
+echo "Start:         docker compose up -d"
+echo "Status:        docker compose ps"
 
 echo ""
 echo -e "${BLUE}=== Update Deployment ===${NC}"
 echo "cd $PROJECT_DIR"
 echo "git pull"
-echo "docker pull ghcr.io/caqil/nyyu-market:latest"
-echo "docker compose -f docker-compose.prod.yml up -d"
+echo "docker compose build"
+echo "docker compose up -d"
 
 echo ""
 echo -e "${YELLOW}=== Important ===${NC}"
