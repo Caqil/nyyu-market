@@ -20,8 +20,8 @@ echo -e "${BLUE}================================================${NC}"
 echo ""
 
 # Configuration
-SSH_KEY="$HOME/Downloads/Azure-NYYU.pem"
-SERVER="azureuser@market.nyyu.io"
+SSH_KEY="$HOME/Downloads/market_key.pem"
+SERVER="azureuser@20.77.27.75"
 REMOTE_DIR="/opt/nyyu-market"
 
 # Check if SSH key exists
@@ -130,6 +130,18 @@ echo -e "${YELLOW}[4/5] Setting up environment...${NC}"
 
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" bash << 'ENDSSH'
 set -e
+
+# Install Docker if not present
+if ! command -v docker &> /dev/null; then
+    echo "Installing Docker..."
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+    sudo sh /tmp/get-docker.sh
+    sudo usermod -aG docker $USER
+    echo "✅ Docker installed"
+else
+    echo "✅ Docker already installed"
+fi
+
 cd /opt/nyyu-market
 
 # Make binary executable
@@ -198,21 +210,28 @@ ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" bash << 'ENDSSH'
 set -e
 cd /opt/nyyu-market
 
+# Use sudo for docker if user not in docker group yet
+DOCKER_CMD="docker"
+if ! docker ps &> /dev/null; then
+    echo "Using sudo for docker (group membership will take effect after logout)"
+    DOCKER_CMD="sudo docker"
+fi
+
 echo "Stopping existing containers..."
-docker compose down 2>/dev/null || true
+$DOCKER_CMD compose down 2>/dev/null || true
 
 echo "Building Docker image (fast, no compilation)..."
-docker compose build
+$DOCKER_CMD compose build
 
 echo "Starting services..."
-docker compose up -d
+$DOCKER_CMD compose up -d
 
 echo "Waiting for services to start..."
 sleep 10
 
 echo ""
 echo "=== Container Status ==="
-docker compose ps
+$DOCKER_CMD compose ps
 
 echo ""
 echo "=== Testing Health Endpoint ==="
