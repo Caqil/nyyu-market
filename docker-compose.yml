@@ -7,17 +7,16 @@ services:
     container_name: nyyu-market-clickhouse
     restart: unless-stopped
     ports:
-      - "9000:9000"   # Native protocol
-      - "8123:8123"   # HTTP interface
+      - "127.0.0.1:9000:9000"   # Native protocol (localhost only)
+      - "127.0.0.1:8123:8123"   # HTTP interface (localhost only)
     environment:
       - CLICKHOUSE_DB=trade
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
-      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./migrations/clickhouse:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--password", "${CLICKHOUSE_PASSWORD}", "--query", "SELECT 1"]
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -28,12 +27,12 @@ services:
     container_name: nyyu-market-redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+      - "127.0.0.1:6379:6379"  # Localhost only
+    command: redis-server --appendonly yes
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "--pass", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -61,12 +60,12 @@ services:
       - CLICKHOUSE_PORT=9000
       - CLICKHOUSE_DATABASE=trade
       - CLICKHOUSE_USERNAME=default
-      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_PASSWORD=
 
       # Redis (SEPARATE instance)
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_PASSWORD=
       - REDIS_DB=0
 
       # Cache configuration

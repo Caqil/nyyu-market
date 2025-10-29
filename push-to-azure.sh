@@ -103,9 +103,7 @@ chmod +x nyyu-market
 
 # Generate .env if it doesn't exist
 if [ ! -f .env ]; then
-    echo "Generating passwords..."
-    CLICKHOUSE_PASSWORD=$(openssl rand -base64 32)
-    REDIS_PASSWORD=$(openssl rand -base64 32)
+    echo "Creating .env file..."
 
     cat > .env <<EOF
 SERVER_PORT=50051
@@ -116,11 +114,11 @@ CLICKHOUSE_HOST=clickhouse
 CLICKHOUSE_PORT=9000
 CLICKHOUSE_DATABASE=trade
 CLICKHOUSE_USERNAME=default
-CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+CLICKHOUSE_PASSWORD=
 
 REDIS_HOST=redis
 REDIS_PORT=6379
-REDIS_PASSWORD=${REDIS_PASSWORD}
+REDIS_PASSWORD=
 REDIS_DB=0
 REDIS_PUBSUB_CHANNEL=nyyu:market:updates
 
@@ -147,20 +145,7 @@ LOG_LEVEL=info
 LOG_FORMAT=json
 EOF
 
-    # Save passwords
-    cat > passwords.txt <<EOF
-=== NYYU MARKET PASSWORDS ===
-Generated: $(date)
-
-ClickHouse: ${CLICKHOUSE_PASSWORD}
-Redis: ${REDIS_PASSWORD}
-
-Save these passwords securely!
-EOF
-    chmod 600 passwords.txt
-
-    echo "✅ Environment configured"
-    echo "⚠️  Passwords saved in: /opt/nyyu-market/passwords.txt"
+    echo "✅ Environment configured (no passwords needed)"
 else
     echo "✅ Using existing .env file"
 fi
