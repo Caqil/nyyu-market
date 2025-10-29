@@ -211,12 +211,24 @@ configure_nginx() {
 
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         USE_DOMAINS=true
-        read -p "Enter your HTTP API domain (e.g., api.yourdomain.com): " HTTP_DOMAIN
-        read -p "Enter your gRPC API domain (e.g., grpc.yourdomain.com): " GRPC_DOMAIN
+        read -p "Enter your domain (e.g., market.nyyu.io): " HTTP_DOMAIN
 
-        if [[ -z "$HTTP_DOMAIN" ]] || [[ -z "$GRPC_DOMAIN" ]]; then
-            print_error "Domain names are required"
+        if [[ -z "$HTTP_DOMAIN" ]]; then
+            print_error "Domain name is required"
             exit 1
+        fi
+
+        read -p "Use the same domain for gRPC? (Y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+            read -p "Enter your gRPC domain (e.g., grpc.market.nyyu.io): " GRPC_DOMAIN
+            if [[ -z "$GRPC_DOMAIN" ]]; then
+                print_error "gRPC domain name is required"
+                exit 1
+            fi
+        else
+            GRPC_DOMAIN="$HTTP_DOMAIN"
+            print_info "Using same domain for both HTTP and gRPC: $HTTP_DOMAIN"
         fi
     else
         USE_DOMAINS=false
