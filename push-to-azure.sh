@@ -31,6 +31,22 @@ if [ ! -f "$SSH_KEY" ]; then
     exit 1
 fi
 
+# Set correct permissions on SSH key
+chmod 600 "$SSH_KEY"
+
+# Test SSH connection
+echo "Testing SSH connection..."
+if ! ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SERVER" "echo 'Connection OK'" &>/dev/null; then
+    echo -e "${RED}❌ Cannot connect to server${NC}"
+    echo "Please check:"
+    echo "  - SSH key is correct"
+    echo "  - Server is reachable: market.nyyu.io"
+    echo "  - Your internet connection"
+    exit 1
+fi
+echo -e "${GREEN}✅ SSH connection OK${NC}"
+echo ""
+
 ###############################################################################
 # Step 1: Build Binary
 ###############################################################################
@@ -79,10 +95,10 @@ echo ""
 echo -e "${YELLOW}[3/5] Uploading to Azure server...${NC}"
 
 # Create directory on server
-ssh -i "$SSH_KEY" "$SERVER" "sudo mkdir -p $REMOTE_DIR && sudo chown -R azureuser:azureuser $REMOTE_DIR"
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" "sudo mkdir -p $REMOTE_DIR && sudo chown -R azureuser:azureuser $REMOTE_DIR"
 
 # Upload files using rsync
-rsync -avz --progress -e "ssh -i $SSH_KEY" \
+rsync -avz --progress -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no" \
     "$TEMP_DIR/" "$SERVER:$REMOTE_DIR/"
 
 echo -e "${GREEN}✅ Files uploaded${NC}"
@@ -94,7 +110,7 @@ echo -e "${GREEN}✅ Files uploaded${NC}"
 echo ""
 echo -e "${YELLOW}[4/5] Setting up environment...${NC}"
 
-ssh -i "$SSH_KEY" "$SERVER" bash << 'ENDSSH'
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" bash << 'ENDSSH'
 set -e
 cd /opt/nyyu-market
 
@@ -160,7 +176,7 @@ echo -e "${GREEN}✅ Environment ready${NC}"
 echo ""
 echo -e "${YELLOW}[5/5] Deploying application...${NC}"
 
-ssh -i "$SSH_KEY" "$SERVER" bash << 'ENDSSH'
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" bash << 'ENDSSH'
 set -e
 cd /opt/nyyu-market
 
