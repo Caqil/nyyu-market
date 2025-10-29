@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+package nyyu.market.v1;
+
+option go_package = "nyyu-market/proto/marketpb";
+
+import "google/protobuf/timestamp.proto";
+
+// MarketService provides high-performance candle, kline, and price data
+service MarketService {
+  // Candle operations
+  rpc GetCandles(GetCandlesRequest) returns (GetCandlesResponse);
+  rpc GetLatestCandle(GetLatestCandleRequest) returns (Candle);
+  rpc SubscribeCandles(SubscribeCandlesRequest) returns (stream CandleUpdate);
+
+  // Price operations
+  rpc GetPrice(GetPriceRequest) returns (Price);
+  rpc GetPrices(GetPricesRequest) returns (GetPricesResponse);
+  rpc SubscribePrices(SubscribePricesRequest) returns (stream PriceUpdate);
+
+  // Mark price operations (futures)
+  rpc GetMarkPrice(GetMarkPriceRequest) returns (MarkPrice);
+  rpc GetMarkPrices(GetMarkPricesRequest) returns (GetMarkPricesResponse);
+  rpc SubscribeMarkPrices(SubscribeMarkPricesRequest) returns (stream MarkPriceUpdate);
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Stats and info
+  rpc GetStats(GetStatsRequest) returns (StatsResponse);
+}
+
+// Candle messages
+message Candle {
+  string symbol = 1;
+  string interval = 2;
+  int64 open_time = 3;   // Unix timestamp in milliseconds
+  int64 close_time = 4;  // Unix timestamp in milliseconds
+  string open = 5;
+  string high = 6;
+  string low = 7;
+  string close = 8;
+  string volume = 9;
+  string quote_volume = 10;
+  int32 trade_count = 11;
+  bool is_closed = 12;
+  string source = 13;
+  string contract_type = 14; // spot, futures, perpetual
+}
+
+message GetCandlesRequest {
+  string symbol = 1;
+  string interval = 2;
+  optional int64 start_time = 3;  // Unix timestamp in milliseconds
+  optional int64 end_time = 4;    // Unix timestamp in milliseconds
+  optional int32 limit = 5;
+  optional string source = 6;     // binance, kraken, coinbase, aggregated, etc.
+  optional string contract_type = 7; // spot, futures, perpetual
+}
+
+message GetCandlesResponse {
+  repeated Candle candles = 1;
+}
+
+message GetLatestCandleRequest {
+  string symbol = 1;
+  string interval = 2;
+  optional string source = 3;
+  optional string contract_type = 4;
+}
+
+message SubscribeCandlesRequest {
+  string symbol = 1;
+  string interval = 2;
+  optional string source = 3;
+}
+
+message CandleUpdate {
+  Candle candle = 1;
+  google.protobuf.Timestamp timestamp = 2;
+}
+
+// Price messages
+message Price {
+  string symbol = 1;
+  string last_price = 2;
+  string price_change_24h = 3;
+  string price_change_24h_percent = 4;
+  string high_24h = 5;
+  string low_24h = 6;
+  string volume_24h = 7;
+  string quote_volume_24h = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message GetPriceRequest {
+  string symbol = 1;
+}
+
+message GetPricesRequest {
+  repeated string symbols = 1; // Empty = all symbols
+}
+
+message GetPricesResponse {
+  repeated Price prices = 1;
+}
+
+message SubscribePricesRequest {
+  repeated string symbols = 1; // Empty = all symbols
+}
+
+message PriceUpdate {
+  Price price = 1;
+  google.protobuf.Timestamp timestamp = 2;
+}
+
+// Mark price messages (futures)
+message MarkPrice {
+  string symbol = 1;
+  string mark_price = 2;
+  string index_price = 3;
+  string last_price = 4;
+  string funding_basis = 5;
+  string estimated_funding_rate = 6;
+  google.protobuf.Timestamp next_funding_time = 7;
+  google.protobuf.Timestamp timestamp = 8;
+}
+
+message GetMarkPriceRequest {
+  string symbol = 1;
+}
+
+message GetMarkPricesRequest {
+  repeated string symbols = 1; // Empty = all symbols
+}
+
+message GetMarkPricesResponse {
+  repeated MarkPrice mark_prices = 1;
+}
+
+message SubscribeMarkPricesRequest {
+  repeated string symbols = 1; // Empty = all symbols
+}
+
+message MarkPriceUpdate {
+  MarkPrice mark_price = 1;
+  google.protobuf.Timestamp timestamp = 2;
+}
+
+// Health and stats messages
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string version = 2;
+  int64 uptime_seconds = 3;
+  map<string, string> services = 4; // service name -> status
+}
+
+message GetStatsRequest {}
+
+message StatsResponse {
+  int64 total_candles = 1;
+  int64 total_symbols = 2;
+  int64 active_subscriptions = 3;
+  int64 price_updates_per_second = 4;
+  int64 candle_writes_per_second = 5;
+  map<string, ExchangeStats> exchange_stats = 6;
+}
+
+message ExchangeStats {
+  string name = 1;
+  bool is_healthy = 2;
+  int64 message_count = 3;
+  int64 error_count = 4;
+  google.protobuf.Timestamp last_update = 5;
+}

@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # ClickHouse - Separate instance for nyyu-market
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: nyyu-market-clickhouse
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # Native protocol
+      - "8123:8123"   # HTTP interface
+    environment:
+      - CLICKHOUSE_DB=trade
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./migrations/clickhouse:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Separate instance for nyyu-market
+  redis:
+    image: redis:7-alpine
+    container_name: nyyu-market-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Nyyu Market Service
+  nyyu-market:
+    build: .
+    container_name: nyyu-market
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "50051:50051"  # gRPC
+      - "8080:8080"    # HTTP
+    environment:
+      - SERVER_PORT=50051
+      - HTTP_PORT=8080
+      - ENVIRONMENT=production
+
+      # ClickHouse (SEPARATE instance)
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_DATABASE=trade
+      - CLICKHOUSE_USERNAME=default
+      - CLICKHOUSE_PASSWORD=
+
+      # Redis (SEPARATE instance)
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - REDIS_DB=0
+
+      # Cache configuration
+      - CACHE_TTL_PRICE=60
+      - CACHE_TTL_MARK_PRICE=3
+      - CACHE_TTL_CANDLE=5
+
+      # Service configuration
+      - MAX_CANDLES_LIMIT=1000
+      - DEFAULT_CANDLES_LIMIT=100
+      - BATCH_WRITE_SIZE=100
+      - BATCH_WRITE_INTERVAL=1s
+
+      # Exchange configuration
+      - ENABLE_BINANCE=true
+      - ENABLE_KRAKEN=true
+      - ENABLE_COINBASE=true
+      - ENABLE_BYBIT=true
+      - ENABLE_OKX=true
+      - ENABLE_GATEIO=true
+
+      # Mark price configuration
+      - MARK_PRICE_UPDATE_INTERVAL=3s
+      - FUNDING_RATE_EMA_PERIOD=20
+
+      # Logging
+      - LOG_LEVEL=info
+      - LOG_FORMAT=json
+    volumes:
+      - ./logs:/root/logs
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  clickhouse_data:
+    driver: local
+  redis_data:
+    driver: local

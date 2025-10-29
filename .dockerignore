@@ -1,0 +1,63 @@
+# Git
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+docs/
+CLAUDE.md
+EXCHANGE_IMPLEMENTATION_COMPLETE.md
+ADMIN_FRONTEND_*.md
+BINANCE_STYLE_SWEEP_SYSTEM.md
+CRITICAL_FIX_*.md
+DEPLOYMENT_CHECKLIST.md
+DYNAMIC_GAS_FEE_IMPLEMENTATION.md
+SWEEP_GAS_FUNDING_EXPLAINED.md
+TESTING_BATCH_SWEEP.md
+USER_PAID_GAS_IMPLEMENTATION.md
+WALLET_FRONTEND_UPDATE.md
+
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+nyyu-market
+
+# Test files
+*_test.go
+test/
+*.test
+coverage.out
+
+# Development
+.env.local
+.env.development
+*.log
+logs/
+debug_*.sh
+test_*.go
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies (will be downloaded in container)
+vendor/
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Scripts
+scripts/
