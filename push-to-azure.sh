@@ -53,7 +53,14 @@ echo ""
 
 echo -e "${YELLOW}[1/5] Building binary for Linux...${NC}"
 
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-w -s" -o nyyu-market ./cmd/server
+# Build with optimization and compression
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-w -s" -trimpath -o nyyu-market ./cmd/server
+
+# Compress binary
+if command -v upx &> /dev/null; then
+    echo "Compressing binary with UPX..."
+    upx -q nyyu-market 2>/dev/null || true
+fi
 
 if [ ! -f "nyyu-market" ]; then
     echo -e "${RED}❌ Build failed${NC}"
@@ -97,9 +104,20 @@ echo -e "${YELLOW}[3/5] Uploading to Azure server...${NC}"
 # Create directory on server
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" "sudo mkdir -p $REMOTE_DIR && sudo chown -R azureuser:azureuser $REMOTE_DIR"
 
-# Upload files using rsync
-rsync -avz --progress -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no" \
-    "$TEMP_DIR/" "$SERVER:$REMOTE_DIR/"
+# Upload files using scp (simpler and shows progress)
+echo "Uploading binary (21MB, ~30-60 seconds)..."
+scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/nyyu-market" "$SERVER:$REMOTE_DIR/"
+
+echo "Uploading config files..."
+scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/Dockerfile" "$SERVER:$REMOTE_DIR/"
+scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/docker-compose.yml" "$SERVER:$REMOTE_DIR/"
+scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/.env.example" "$SERVER:$REMOTE_DIR/"
+
+# Upload migrations if exists
+if [ -d "$TEMP_DIR/migrations" ]; then
+    echo "Uploading migrations..."
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C -r "$TEMP_DIR/migrations" "$SERVER:$REMOTE_DIR/"
+fi
 
 echo -e "${GREEN}✅ Files uploaded${NC}"
 
