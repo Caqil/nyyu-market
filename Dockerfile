@@ -13,15 +13,8 @@ RUN go mod download
 # Copy all source code
 COPY . .
 
-# Debug: Show what files we have
-RUN echo "=== Working directory ===" && pwd && \
-    echo "=== Listing current dir ===" && ls -la && \
-    echo "=== Checking cmd directory ===" && ls -la cmd/ && \
-    echo "=== Checking cmd/server ===" && ls -la cmd/server/ && \
-    echo "=== Checking for main.go ===" && find . -name "main.go"
-
-# Build the application using module path
-RUN CGO_ENABLED=0 GOOS=linux go build -o nyyu-market ./cmd/server
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o nyyu-market ./cmd/server
 
 # Final stage
 FROM alpine:latest
