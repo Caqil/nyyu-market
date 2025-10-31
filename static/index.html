@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nyyu Market - Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    animation: {
+                        'pulse-slow': 'pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .animate-pulse-dot { animation: pulse 2s infinite; }
+
+        /* Custom gradient background */
+        .bg-dark-gradient {
+            background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
+        }
+
+        /* Glass morphism effect */
+        .glass-card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        /* Glow effect */
+        .glow-purple {
+            box-shadow: 0 0 20px rgba(139, 92, 246, 0.3);
+        }
+    </style>
+</head>
+<body class="bg-dark-gradient min-h-screen p-4 md:p-6">
+    <div class="max-w-7xl mx-auto">
+        <!-- Header -->
+        <header class="glass-card rounded-xl p-6 mb-6 flex flex-col md:flex-row justify-between items-center gap-4 glow-purple">
+            <div>
+                <h1 class="text-3xl font-bold bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent mb-1">
+                    ⚡ Nyyu Market Health
+                </h1>
+                <span class="text-gray-300 text-sm font-medium">Real-Time Monitoring</span>
+            </div>
+            <div class="flex items-center gap-4 px-4 py-3 bg-black bg-opacity-30 rounded-lg border border-gray-700">
+                <span class="w-3 h-3 rounded-full bg-yellow-400 animate-pulse-dot" id="statusIndicator"></span>
+                <span class="text-white font-semibold text-sm" id="statusText">Loading...</span>
+                <span class="text-gray-400 text-xs">Updated: <span id="lastUpdate">--</span></span>
+            </div>
+        </header>
+
+        <!-- Quick Stats -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <!-- Latency Card -->
+            <div class="glass-card rounded-xl p-6 hover:glow-purple transition-all">
+                <div class="flex items-center gap-4">
+                    <div class="w-14 h-14 bg-gradient-to-br from-purple-500 to-indigo-600 rounded-xl flex items-center justify-center text-3xl flex-shrink-0 shadow-lg">
+                        ⚡
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-xs font-semibold text-purple-300 uppercase tracking-wide mb-1">Latency (p99)</div>
+                        <div class="text-2xl font-bold text-white" id="latencyValue">-- ms</div>
+                        <div class="text-xs text-gray-400">candle processing</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Price Updates Card -->
+            <div class="glass-card rounded-xl p-6 hover:glow-purple transition-all">
+                <div class="flex items-center gap-4">
+                    <div class="w-14 h-14 bg-gradient-to-br from-pink-500 to-purple-600 rounded-xl flex items-center justify-center text-3xl flex-shrink-0 shadow-lg">
+                        📊
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-xs font-semibold text-pink-300 uppercase tracking-wide mb-1">Price Updates</div>
+                        <div class="text-2xl font-bold text-white" id="priceUpdatesValue">--</div>
+                        <div class="text-xs text-gray-400">total count</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Cache Hit Ratio Card -->
+            <div class="glass-card rounded-xl p-6 hover:glow-purple transition-all">
+                <div class="flex items-center gap-4">
+                    <div class="w-14 h-14 bg-gradient-to-br from-orange-500 to-red-600 rounded-xl flex items-center justify-center text-3xl flex-shrink-0 shadow-lg">
+                        🔥
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-xs font-semibold text-orange-300 uppercase tracking-wide mb-1">Cache Hit Ratio</div>
+                        <div class="text-2xl font-bold text-white" id="cacheRatioValue">--%</div>
+                        <div class="text-xs text-gray-400">memory tier</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Memory Card -->
+            <div class="glass-card rounded-xl p-6 hover:glow-purple transition-all">
+                <div class="flex items-center gap-4">
+                    <div class="w-14 h-14 bg-gradient-to-br from-cyan-500 to-blue-600 rounded-xl flex items-center justify-center text-3xl flex-shrink-0 shadow-lg">
+                        💾
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <div class="text-xs font-semibold text-cyan-300 uppercase tracking-wide mb-1">Memory</div>
+                        <div class="text-2xl font-bold text-white" id="memoryValue">-- MB</div>
+                        <div class="text-xs text-gray-400">allocated</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Row -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <!-- Candle Updates Chart -->
+            <div class="glass-card rounded-xl p-6">
+                <h2 class="text-lg font-bold text-white mb-4 pb-3 border-b-2 border-purple-500 border-opacity-30">
+                    🔥 Candle Updates by Exchange
+                </h2>
+                <div class="h-64">
+                    <canvas id="candleUpdatesChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Publishing Chart -->
+            <div class="glass-card rounded-xl p-6">
+                <h2 class="text-lg font-bold text-white mb-4 pb-3 border-b-2 border-pink-500 border-opacity-30">
+                    📈 Publishing Success vs Failures
+                </h2>
+                <div class="h-64">
+                    <canvas id="publishChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Info Row -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <!-- System Health -->
+            <div class="glass-card rounded-xl p-6">
+                <h2 class="text-lg font-bold text-white mb-4 pb-3 border-b-2 border-cyan-500 border-opacity-30">
+                    💻 System Health
+                </h2>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="flex justify-between items-center p-4 bg-black bg-opacity-30 rounded-lg border border-gray-700">
+                        <span class="text-sm font-semibold text-gray-300">Version</span>
+                        <span class="text-base font-bold text-white" id="versionValue">--</span>
+                    </div>
+                    <div class="flex justify-between items-center p-4 bg-black bg-opacity-30 rounded-lg border border-gray-700">
+                        <span class="text-sm font-semibold text-gray-300">Uptime</span>
+                        <span class="text-base font-bold text-white" id="uptimeValue">--</span>
+                    </div>
+                    <div class="flex justify-between items-center p-4 bg-black bg-opacity-30 rounded-lg border border-gray-700">
+                        <span class="text-sm font-semibold text-gray-300">Goroutines</span>
+                        <span class="text-base font-bold text-white" id="goroutinesValue">--</span>
+                    </div>
+                    <div class="flex justify-between items-center p-4 bg-black bg-opacity-30 rounded-lg border border-gray-700">
+                        <span class="text-sm font-semibold text-gray-300">ClickHouse</span>
+                        <span class="px-3 py-1 rounded-full text-xs font-semibold" id="clickhouseValue">--</span>
+                    </div>
+                    <div class="flex justify-between items-center p-4 bg-black bg-opacity-30 rounded-lg border border-gray-700">
+                        <span class="text-sm font-semibold text-gray-300">Redis</span>
+                        <span class="px-3 py-1 rounded-full text-xs font-semibold" id="redisValue">--</span>
+                    </div>
+                    <div class="flex justify-between items-center p-4 bg-black bg-opacity-30 rounded-lg border border-gray-700">
+                        <span class="text-sm font-semibold text-gray-300">Total Candles</span>
+                        <span class="text-base font-bold text-white" id="totalCandlesValue">--</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Exchange Status -->
+            <div class="glass-card rounded-xl p-6">
+                <h2 class="text-lg font-bold text-white mb-4 pb-3 border-b-2 border-green-500 border-opacity-30">
+                    🌐 Exchange Status
+                </h2>
+                <div class="space-y-3" id="exchangeList">
+                    <!-- Exchanges will be populated here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="glass-card rounded-xl p-5 flex flex-col md:flex-row justify-between items-center gap-3 text-sm">
+            <div class="text-gray-300">Auto-refresh every 5 seconds</div>
+            <div class="flex gap-3">
+                <a href="/metrics" target="_blank" class="text-purple-400 hover:text-purple-300 font-semibold transition-colors">Prometheus Metrics</a>
+                <span class="text-gray-600">|</span>
+                <a href="/api/v1/realtime/status" target="_blank" class="text-cyan-400 hover:text-cyan-300 font-semibold transition-colors">Exchange API</a>
+            </div>
+        </footer>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

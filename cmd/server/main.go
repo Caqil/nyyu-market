@@ -2,26 +2,30 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
 	"nyyu-market/internal/cache"
 	"nyyu-market/internal/config"
 	grpcServer "nyyu-market/internal/grpc"
+	"nyyu-market/internal/metrics"
+	"nyyu-market/internal/proxy"
 	"nyyu-market/internal/pubsub"
 	"nyyu-market/internal/repository"
 	"nyyu-market/internal/services/aggregator"
 	candleService "nyyu-market/internal/services/candle"
 	markpriceService "nyyu-market/internal/services/markprice"
-	priceService "nyyu-market/internal/services/price"
 	"nyyu-market/internal/services/symbols"
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/go-redis/redis/v8"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 )
 
@@ -97,47 +101,84 @@ func main() {
 		DB:       cfg.Redis.DB,
 	})
 
-	ctx := context.Background()
+	// Create root context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	if err := redisClient.Ping(ctx).Err(); err != nil {
 		logger.Fatal("Failed to connect to Redis: ", err)
 	}
 	defer redisClient.Close()
 	logger.Info("Redis connected successfully")
 
+	// ⚡ Start metrics collection goroutine
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				metrics.MemoryAllocated.Set(float64(m.Alloc))
+				metrics.GoroutinesActive.Set(float64(runtime.NumGoroutine()))
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	logger.Info("✅ Metrics collection started")
+
 	// Initialize repositories
 	candleRepo := repository.NewCandleRepository(clickhouseConn, logger)
 
 	// Initialize cache
 	candleCache := cache.NewCandleCache(redisClient, logger)
-	priceCache := cache.NewPriceCache(redisClient, logger)
+	priceCache := cache.NewPriceCache(redisClient, logger) // Still used by markprice service
 
 	// Initialize pub/sub
 	publisher := pubsub.NewPublisher(redisClient, logger)
 
+	// Initialize proxy service (for bypassing 403 errors from exchanges)
+	proxySvc := proxy.NewProxyService(logger)
+	if err := proxySvc.Start(context.Background()); err != nil {
+		logger.WithError(err).Warn("Failed to start proxy service - will use direct connections")
+	} else {
+		logger.Info("Proxy service started - ready to handle 403 errors")
+	}
+
 	// Initialize services
 	candleSvc := candleService.NewService(candleRepo, candleCache, publisher, cfg, logger)
 
-	// Initialize exchange aggregator
-	exchangeAgg := aggregator.NewExchangeAggregator(cfg, candleSvc, publisher, logger)
+	// Initialize exchange aggregator (with proxy support)
+	exchangeAgg := aggregator.NewExchangeAggregator(cfg, candleSvc, publisher, logger, proxySvc)
 
-	// Initialize price service
-	priceSvc := priceService.NewService(candleSvc, priceCache, publisher, cfg, logger)
+	// ⚡ REAL-TIME: Connect exchange aggregator to candle service for in-memory candles
+	candleSvc.SetExchangeAggregator(exchangeAgg)
+
+	// ⚡ NEW: Initialize interval aggregator for building higher timeframes from 1m candles
+	intervalAgg := aggregator.NewIntervalAggregator(candleRepo, publisher, logger)
+	logger.Info("✅ Interval aggregator initialized")
+
+	// ⚡ IMPORTANT: Connect interval aggregator to real-time 1m candle stream
+	exchangeAgg.SetIntervalAggregator(intervalAgg)
 
 	// Initialize mark price service
 	markPriceSvc := markpriceService.NewService(priceCache, publisher, exchangeAgg, cfg, logger)
 
-	// Initialize symbol fetcher
-	symbolAPIURL := fmt.Sprintf("http://localhost:%d/api/v1/binance/candles/symbols", cfg.Server.HTTPPort)
-	symbolFetcher := symbols.NewSymbolFetcher(symbolAPIURL, logger)
-
-	// Start symbol auto-refresh in background
-	go symbolFetcher.StartAutoRefresh(context.Background())
+	// Initialize symbol fetcher - fetch from backend trade service
+	backendTradeURL := os.Getenv("BACKEND_TRADE_SYMBOLS_URL")
+	if backendTradeURL == "" {
+		backendTradeURL = "https://nyyu.vyral.social/api/v1/binance/candles/symbols"
+	}
+	symbolFetcher := symbols.NewSymbolFetcher(backendTradeURL, logger)
 
 	// Initialize gRPC server
-	grpcSrv := grpcServer.NewServer(cfg, candleSvc, priceSvc, markPriceSvc, symbolFetcher, redisClient, logger)
+	grpcSrv := grpcServer.NewServer(cfg, candleSvc, markPriceSvc, symbolFetcher, redisClient, logger)
 
 	// Start HTTP server for health checks
-	go startHTTPServer(cfg, logger, candleSvc)
+	go startHTTPServer(cfg, logger, candleSvc, symbolFetcher, exchangeAgg)
 
 	// Start gRPC server
 	grpcErrChan := make(chan error, 1)
@@ -154,31 +195,80 @@ func main() {
 		logger.WithError(err).Fatal("Failed to start exchange aggregator")
 	}
 
-	// Get popular symbols from API (top 10)
-	popularSymbols, err := symbolFetcher.GetPopularSymbols(context.Background(), 10)
+	// Fetch symbols from backend trade service
+	logger.Info("Fetching symbols from backend trade service...")
+	allSymbols, err := symbolFetcher.GetSymbols(context.Background())
 	if err != nil {
-		logger.WithError(err).Warn("Failed to fetch popular symbols, using defaults")
-		// Fallback to defaults
-		popularSymbols = []string{
-			"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-			"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
+		logger.WithError(err).Warn("Failed to fetch symbols from backend, trying popular symbols...")
+		// Try popular symbols as backup
+		allSymbols, err = symbolFetcher.GetPopularSymbols(context.Background(), 100)
+		if err != nil {
+			logger.WithError(err).Error("Failed to fetch symbols - will retry in background")
+			allSymbols = symbols.DefaultSymbols // Use default symbols
 		}
 	}
 
-	logger.Infof("Subscribing to %d popular symbols", len(popularSymbols))
-	for _, symbol := range popularSymbols {
-		_ = exchangeAgg.SubscribeToSymbol(context.Background(), symbol, "1m")
+	if len(allSymbols) == 0 {
+		logger.Warn("No symbols returned - using default symbols")
+		allSymbols = symbols.DefaultSymbols
 	}
 
-	// Trigger reconnection for all exchanges after subscribing
-	logger.Info("Triggering exchange connections...")
-	exchangeAgg.TriggerReconnectAll()
+	logger.Infof("Loaded %d symbols available for on-demand subscription", len(allSymbols))
 
-	// Start price updater (updates every 10 seconds)
-	go priceSvc.StartPriceUpdater(context.Background(), popularSymbols, 10*time.Second)
+	// ⚡ REAL-TIME FIX: Pre-warm top symbols for instant data availability
+	// Subscribe to popular symbols on startup so first users get instant data
+	// This eliminates the 5-15 second connection delay for common pairs
+	popularSymbols := []string{
+		"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+		"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
+		"LINKUSDT", "UNIUSDT", "ATOMUSDT", "LTCUSDT", "ETCUSDT",
+		"TRXUSDT", "NEARUSDT", "XLMUSDT", "ALGOUSDT", "VETUSDT",
+	}
 
-	// TODO: Mark price updater temporarily disabled until aggregator has data
-	// go markPriceSvc.StartMarkPriceUpdater(context.Background(), popularSymbols)
+	// Filter to only symbols that exist in our backend
+	symbolMap := make(map[string]bool)
+	for _, s := range allSymbols {
+		symbolMap[s] = true
+	}
+
+	prewarmCount := 0
+	for _, symbol := range popularSymbols {
+		if symbolMap[symbol] {
+			// Subscribe to 1m interval - all other intervals are derived from this
+			if err := candleSvc.SubscribeToInterval(context.Background(), symbol, "1m"); err != nil {
+				logger.WithError(err).Warnf("Failed to pre-warm %s", symbol)
+			} else {
+				prewarmCount++
+			}
+		}
+	}
+
+	logger.Infof("⚡ Pre-warmed %d popular symbols for instant real-time data", prewarmCount)
+	logger.Info("Exchange aggregator ready for on-demand subscriptions")
+
+	// Trigger connections now that we have subscriptions
+	if prewarmCount > 0 {
+		exchangeAgg.TriggerReconnectAll()
+		logger.Info("✅ Triggered exchange connections for pre-warmed symbols")
+	}
+
+	// ⚡ PRIORITY 2: Start background 24h stats calculator in candle service
+	candleSvc.Start24hStatsCalculator(context.Background())
+	logger.Info("✅ Started 24h stats calculator for price tickers")
+
+	// ⚡ NEW: Start interval aggregator for building higher timeframes
+	intervalAgg.Start()
+	logger.Info("✅ Interval aggregator started - building 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M candles")
+
+	// ⚡ IMPORTANT: Price tickers are now derived from candles!
+	// The system is FULLY on-demand:
+	// 1. User calls SubscribePrice gRPC → subscribes to 1m candles → gets real-time prices
+	// 2. Price = candle.Close + 24h stats from background calculator
+	// 3. No separate price service needed - everything from candles!
+	logger.Info("⚡ Price tickers integrated into candle service")
+
+	// Start symbol auto-refresh in background
+	go symbolFetcher.StartAutoRefresh(context.Background())
 
 	logger.Infof("Nyyu Market Service v%s started successfully", version)
 	logger.Infof("HTTP server listening on :%d", cfg.Server.HTTPPort)
@@ -190,21 +280,83 @@ func main() {
 
 	select {
 	case <-sigChan:
-		logger.Info("Received shutdown signal")
+		logger.Info("📥 Received shutdown signal")
 	case err := <-grpcErrChan:
-		logger.WithError(err).Error("gRPC server error")
+		logger.WithError(err).Error("❌ gRPC server error")
 	}
 
-	logger.Info("Shutting down gracefully...")
+	logger.Info("🛑 Initiating graceful shutdown...")
 
-	// Stop gRPC server
-	grpcSrv.Stop()
+	// Cancel root context to signal all services
+	cancel()
 
-	// Stop exchange aggregator
-	exchangeAgg.Stop()
+	// Create shutdown context with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
 
-	time.Sleep(2 * time.Second)
-	logger.Info("Shutdown complete")
+	// Coordinated shutdown sequence
+	shutdownSteps := []struct {
+		name string
+		fn   func() error
+	}{
+		{
+			name: "gRPC server",
+			fn: func() error {
+				grpcSrv.Stop()
+				logger.Info("✅ gRPC server stopped")
+				return nil
+			},
+		},
+		{
+			name: "Interval aggregator",
+			fn: func() error {
+				intervalAgg.Stop()
+				logger.Info("✅ Interval aggregator stopped")
+				return nil
+			},
+		},
+		{
+			name: "Exchange aggregator",
+			fn: func() error {
+				exchangeAgg.Stop()
+				logger.Info("✅ Exchange aggregator stopped")
+				return nil
+			},
+		},
+		{
+			name: "Symbol fetcher",
+			fn: func() error {
+				// Symbol fetcher uses ctx which is now cancelled
+				logger.Info("✅ Symbol fetcher stopped")
+				return nil
+			},
+		},
+	}
+
+	// Execute shutdown steps with timeout
+	for _, step := range shutdownSteps {
+		done := make(chan error, 1)
+		go func(s struct {
+			name string
+			fn   func() error
+		}) {
+			done <- s.fn()
+		}(step)
+
+		select {
+		case err := <-done:
+			if err != nil {
+				logger.WithError(err).Warnf("⚠️  Failed to stop %s gracefully", step.name)
+			}
+		case <-shutdownCtx.Done():
+			logger.Warnf("⏱️  Timeout stopping %s", step.name)
+		}
+	}
+
+	// Give a moment for final cleanup
+	time.Sleep(500 * time.Millisecond)
+
+	logger.Info("✅ Graceful shutdown complete - all services stopped")
 }
 
 func runMigrations(conn clickhouse.Conn, logger *logrus.Logger) error {
@@ -264,15 +416,45 @@ func runMigrations(conn clickhouse.Conn, logger *logrus.Logger) error {
 	return nil
 }
 
-func startHTTPServer(cfg *config.Config, logger *logrus.Logger, candleSvc *candleService.Service) {
+func startHTTPServer(cfg *config.Config, logger *logrus.Logger, candleSvc *candleService.Service, symbolFetcher *symbols.SymbolFetcher, exchangeAgg *aggregator.ExchangeAggregator) {
 	mux := http.NewServeMux()
 
-	// Health check endpoint
+	// ⚡ Static files for dashboard
+	fs := http.FileServer(http.Dir("./static"))
+	mux.Handle("/static/", http.StripPrefix("/static/", fs))
+	logger.Info("✅ Dashboard UI available at /health")
+
+	// Root route - redirect to health UI
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/health", http.StatusFound)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	// Health UI - dashboard page
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "./static/index.html")
+	})
+
+	// ⚡ Prometheus metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+	logger.Info("✅ Prometheus metrics available at /metrics")
+
+	// Symbols endpoint - returns all supported trading symbols
+	mux.HandleFunc("/api/v1/binance/candles/symbols", func(w http.ResponseWriter, r *http.Request) {
+		allSymbols, _ := symbolFetcher.GetSymbols(context.Background())
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"healthy":true,"version":"%s","uptime_seconds":%d,"services":{"clickhouse":"healthy","redis":"healthy"}}`,
-			version, int64(time.Since(startTime).Seconds()))
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Available symbols retrieved successfully",
+			"data": map[string]interface{}{
+				"count":   len(allSymbols),
+				"symbols": allSymbols,
+			},
+		})
 	})
 
 	// Stats endpoint
@@ -287,6 +469,24 @@ func startHTTPServer(cfg *config.Config, logger *logrus.Logger, candleSvc *candl
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"total_candles":%v,"total_symbols":%v}`, stats["total_candles"], stats["total_symbols"])
+	})
+
+	// ⚡ REAL-TIME FIX: Add real-time monitoring endpoint
+	mux.HandleFunc("/api/v1/realtime/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		exchangeStats := exchangeAgg.GetExchangeStats()
+		statsJSON, _ := json.Marshal(map[string]interface{}{
+			"success": true,
+			"message": "Real-time market data status",
+			"data": map[string]interface{}{
+				"version":        version,
+				"uptime_seconds": int64(time.Since(startTime).Seconds()),
+				"exchanges":      exchangeStats,
+			},
+		})
+		w.Write(statsJSON)
 	})
 
 	addr := fmt.Sprintf(":%d", cfg.Server.HTTPPort)

@@ -155,17 +155,33 @@ func (s *Service) UpdateMarkPrice(ctx context.Context, symbol string) error {
 }
 
 // StartMarkPriceUpdater starts background mark price calculation
+// Now uses event-driven updates (triggered by price changes) + timer as backup
 func (s *Service) StartMarkPriceUpdater(ctx context.Context, symbols []string) {
+	s.logger.Infof("⚡ Starting mark price updater (interval: %v, symbols: %d)", s.config.MarkPrice.UpdateInterval, len(symbols))
+
+	// ⚡ INSTANT: Subscribe to real-time price updates from aggregator
+	s.logger.Info("⚡ Subscribing to real-time price updates for instant mark price calculations...")
+	for _, symbol := range symbols {
+		sym := symbol // Capture for closure
+		s.aggregator.SubscribePrice(sym, func(symbol string, price decimal.Decimal, exchangeCount int) {
+			// ⚡ Update mark price IMMEDIATELY when price changes
+			if err := s.UpdateMarkPrice(ctx, sym); err != nil {
+				s.logger.WithError(err).Debugf("Failed to update mark price for %s", sym)
+			}
+		})
+		s.logger.Debugf("✅ Subscribed to real-time prices for %s", sym)
+	}
+
+	// ⚡ Timer as backup (catches any symbols that don't have active price updates)
 	ticker := time.NewTicker(s.config.MarkPrice.UpdateInterval)
 	defer ticker.Stop()
-
-	s.logger.Infof("Starting mark price updater (interval: %v, symbols: %d)", s.config.MarkPrice.UpdateInterval, len(symbols))
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Backup timer - updates all symbols
 			for _, symbol := range symbols {
 				go func(sym string) {
 					if err := s.UpdateMarkPrice(ctx, sym); err != nil {

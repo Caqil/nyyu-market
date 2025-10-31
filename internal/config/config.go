@@ -119,7 +119,7 @@ func Load() (*Config, error) {
 			EnableGateIO:   getEnvBool("ENABLE_GATEIO", true),
 		},
 		MarkPrice: MarkPriceConfig{
-			UpdateInterval: parseDuration(getEnv("MARK_PRICE_UPDATE_INTERVAL", "3s"), 3*time.Second),
+			UpdateInterval: parseDuration(getEnv("MARK_PRICE_UPDATE_INTERVAL", "100ms"), 100*time.Millisecond),
 			EMAPeriod:      getEnvInt("FUNDING_RATE_EMA_PERIOD", 20),
 		},
 		Logging: LoggingConfig{

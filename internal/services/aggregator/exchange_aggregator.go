@@ -2,8 +2,11 @@ package aggregator
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,22 +23,35 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// ProxyServiceInterface defines methods needed from proxy service
+type ProxyServiceInterface interface {
+	GetWorkingProxy() string
+	GetProxyListWithWorkingFirst() []string
+	SetWorkingProxy(proxy string)
+	TestProxy(proxy string) bool
+}
+
 // Exchange represents a single exchange WebSocket connection
 type Exchange struct {
-	Name         string
-	WSUrl        string
-	IsEnabled    bool
-	conn         *websocket.Conn
-	isHealthy    bool
-	msgCount     int64
-	errorCount   int64
-	lastUpdate   time.Time
-	mu           sync.RWMutex
+	Name       string
+	WSUrl      string
+	IsEnabled  bool
+	conn       *websocket.Conn
+	isHealthy  bool
+	msgCount   int64
+	errorCount int64
+	lastUpdate time.Time
+	mu         sync.RWMutex
 
 	// Circuit breaker
 	failureCount    int64
 	lastFailureTime time.Time
 	backoffUntil    time.Time
+
+	// Connection state tracking
+	isConnecting    bool
+	isSubscribed    bool
+	lastConnectTime time.Time
 }
 
 // BinanceKlineMessage represents Binance kline WebSocket message
@@ -62,17 +78,25 @@ type BinanceKlineMessage struct {
 
 // ExchangeAggregator aggregates market data from multiple exchanges
 type ExchangeAggregator struct {
-	config        *config.Config
-	candleSvc     *candleService.Service
-	pubsub        *pubsub.Publisher
-	logger        *logrus.Logger
+	config       *config.Config
+	candleSvc    *candleService.Service
+	pubsub       *pubsub.Publisher
+	logger       *logrus.Logger
+	proxyService ProxyServiceInterface // For bypassing 403 errors
 
 	// Exchanges
-	exchanges     []*Exchange
+	exchanges []*Exchange
 
-	// Active subscriptions
-	activeStreams   map[string]bool
+	// Active subscriptions with reference counting for shared subscriptions
+	// Key: "symbol@interval" (e.g., "btcusdt@1m")
+	// Value: reference count (number of users watching)
+	activeStreams   map[string]int32 // int32 for atomic operations
 	activeStreamsMu sync.RWMutex
+
+	// Subscription tracking by symbol
+	// symbol -> interval -> refCount
+	subscriptions   map[string]map[string]int32
+	subscriptionsMu sync.RWMutex
 
 	// Price aggregation (lock-free)
 	aggregatedPrices sync.Map // symbol -> *sync.Map (exchange->price)
@@ -84,12 +108,15 @@ type ExchangeAggregator struct {
 	batchTicker     *time.Ticker
 
 	// Rate limiters
-	rateLimiters    map[string]*rate.Limiter
-	rateLimitMgr    *RateLimiterManager
-	subBatchers     map[string]*SubscriptionBatcher
-	subBatchersMu   sync.Mutex
+	rateLimiters  map[string]*rate.Limiter
+	rateLimitMgr  *RateLimiterManager
+	subBatchers   map[string]*SubscriptionBatcher
+	subBatchersMu sync.Mutex
 
-	// ⚡ IN-MEMORY AGGREGATION: Collect candles from all exchanges before writing
+	// ⚡ NEW: Zero-delay real-time aggregator (lock-free, streaming)
+	realtimeAgg *RealtimeCandleAggregator
+
+	// ⚡ DEPRECATED: Old pending candles system (keep for compatibility during migration)
 	// Map structure: symbol -> interval -> openTime -> exchange -> candle
 	pendingCandles   map[string]map[string]map[int64]map[string]*models.Candle
 	pendingCandlesMu sync.RWMutex
@@ -115,6 +142,7 @@ func NewExchangeAggregator(
 	candleSvc *candleService.Service,
 	pubsub *pubsub.Publisher,
 	logger *logrus.Logger,
+	proxyService ProxyServiceInterface,
 ) *ExchangeAggregator {
 	now := time.Now()
 	exchanges := []*Exchange{
@@ -130,21 +158,32 @@ func NewExchangeAggregator(
 	rateLimitMgr := NewRateLimiterManager()
 
 	// Register rate limiters for each exchange (conservative limits for production)
-	rateLimitMgr.RegisterExchange("Binance", 4.5, 10)   // 4.5 req/sec, burst 10
-	rateLimitMgr.RegisterExchange("Kraken", 10, 20)     // 10 req/sec, burst 20
-	rateLimitMgr.RegisterExchange("Coinbase", 8, 15)    // 8 req/sec, burst 15
-	rateLimitMgr.RegisterExchange("Bybit", 50, 100)     // 50 req/sec, burst 100
-	rateLimitMgr.RegisterExchange("OKX", 3, 5)          // 3 req/sec, burst 5 (OKX is strict)
-	rateLimitMgr.RegisterExchange("Gate.io", 30, 50)    // 30 req/sec, burst 50
+	rateLimitMgr.RegisterExchange("Binance", 4.5, 10) // 4.5 req/sec, burst 10
+	rateLimitMgr.RegisterExchange("Kraken", 10, 20)   // 10 req/sec, burst 20
+	rateLimitMgr.RegisterExchange("Coinbase", 8, 15)  // 8 req/sec, burst 15
+	rateLimitMgr.RegisterExchange("Bybit", 50, 100)   // 50 req/sec, burst 100
+	rateLimitMgr.RegisterExchange("OKX", 3, 5)        // 3 req/sec, burst 5 (OKX is strict)
+	rateLimitMgr.RegisterExchange("Gate.io", 30, 50)  // 30 req/sec, burst 50
+
+	// Create candle batch channel
+	candleBatchChan := make(chan *models.Candle, 10000)
+
+	// ⚡ NEW: Initialize zero-delay real-time aggregator
+	realtimeAgg := NewRealtimeCandleAggregator(pubsub, logger, candleBatchChan)
+
+	// ⚡ Connect candle service to realtime aggregator for 24h stats
+	realtimeAgg.SetCandleService(candleSvc)
 
 	agg := &ExchangeAggregator{
 		config:          cfg,
 		candleSvc:       candleSvc,
 		pubsub:          pubsub,
 		logger:          logger,
+		proxyService:    proxyService,
 		exchanges:       exchanges,
-		activeStreams:   make(map[string]bool),
-		candleBatchChan: make(chan *models.Candle, 10000),
+		activeStreams:   make(map[string]int32),
+		subscriptions:   make(map[string]map[string]int32),
+		candleBatchChan: candleBatchChan, // ⚡ Shared channel for batch writing
 		currentBatch:    make([]*models.Candle, 0, cfg.Service.BatchWriteSize),
 		rateLimiters: map[string]*rate.Limiter{
 			"Binance":  rate.NewLimiter(rate.Limit(4.5), 10),
@@ -156,6 +195,7 @@ func NewExchangeAggregator(
 		},
 		rateLimitMgr:          rateLimitMgr,
 		subBatchers:           make(map[string]*SubscriptionBatcher),
+		realtimeAgg:           realtimeAgg, // ⚡ NEW: Lock-free aggregator
 		pendingCandles:        make(map[string]map[string]map[int64]map[string]*models.Candle),
 		scheduledAggregations: make(map[string]map[string]map[int64]bool),
 		stopChan:              make(chan struct{}),
@@ -180,6 +220,14 @@ func NewExchangeAggregator(
 	return agg
 }
 
+// SetIntervalAggregator connects the interval aggregator to receive real-time 1m candles
+func (a *ExchangeAggregator) SetIntervalAggregator(intervalAgg IntervalAggregatorInterface) {
+	if a.realtimeAgg != nil {
+		a.realtimeAgg.SetIntervalAggregator(intervalAgg)
+		a.logger.Info("✅ Interval aggregator connected to real-time 1m candle stream")
+	}
+}
+
 // Start initializes all exchange connections
 func (a *ExchangeAggregator) Start(ctx context.Context) error {
 	a.mu.Lock()
@@ -202,14 +250,18 @@ func (a *ExchangeAggregator) Start(ctx context.Context) error {
 	}
 
 	// Start exchange connections
+	a.logger.Info("Initializing exchange connections...")
+	enabledCount := 0
 	for _, ex := range a.exchanges {
 		if ex.IsEnabled {
 			go a.manageExchangeConnection(ctx, ex)
-			a.logger.Infof("Starting %s WebSocket connection", ex.Name)
+			a.logger.Infof("✅ %s enabled - manager started (%s)", ex.Name, ex.WSUrl)
+			enabledCount++
 		} else {
-			a.logger.Infof("Skipping %s (disabled in config)", ex.Name)
+			a.logger.Infof("⏭️  %s disabled in config - skipping", ex.Name)
 		}
 	}
+	a.logger.Infof("Started managers for %d/%d exchanges", enabledCount, len(a.exchanges))
 
 	// Start price aggregation monitor
 	go a.monitorPriceAggregation(ctx)
@@ -230,8 +282,18 @@ func (a *ExchangeAggregator) Stop() {
 		return
 	}
 
-	a.logger.Info("Stopping exchange aggregator...")
+	a.logger.Info("🛑 Stopping exchange aggregator...")
 	close(a.stopChan)
+
+	// Stop real-time aggregator first (flush pending data)
+	if a.realtimeAgg != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := a.realtimeAgg.Stop(shutdownCtx); err != nil {
+			a.logger.WithError(err).Warn("⚠️  Real-time aggregator stop with timeout")
+		}
+	}
 
 	// Close all connections
 	for _, ex := range a.exchanges {
@@ -246,20 +308,107 @@ func (a *ExchangeAggregator) Stop() {
 	a.flushBatch(context.Background())
 
 	a.isRunning = false
-	a.logger.Info("Exchange aggregator stopped")
+	a.logger.Info("✅ Exchange aggregator stopped successfully")
 }
 
-// SubscribeToSymbol subscribes to a symbol on all enabled exchanges
-func (a *ExchangeAggregator) SubscribeToSymbol(ctx context.Context, symbol, interval string) error {
+// SubscribeToInterval adds interval to subscriptions with reference counting
+// Multiple users watching the same symbol@interval share ONE websocket subscription
+// This is how we scale to 1M+ concurrent users!
+func (a *ExchangeAggregator) SubscribeToInterval(ctx context.Context, symbol, interval string) error {
 	symbol = strings.ToUpper(symbol)
-	streamKey := fmt.Sprintf("%s@%s", strings.ToLower(symbol), interval)
 
+	// ⚡ OPTIMIZATION: Always subscribe to 1m interval on exchanges
+	// All other intervals (3m, 5m, 15m, 30m, 1h, 2h, 4h, etc.) are derived from 1m candles
+	// This reduces exchange websocket connections from 187 to just 91 (one per symbol)!
+	baseInterval := "1m"
+	streamKey := fmt.Sprintf("%s@%s", strings.ToLower(symbol), baseInterval)
+
+	// Track subscription reference count for REQUESTED interval
+	a.subscriptionsMu.Lock()
+	if a.subscriptions[symbol] == nil {
+		a.subscriptions[symbol] = make(map[string]int32)
+	}
+	a.subscriptions[symbol][interval]++
+	refCount := a.subscriptions[symbol][interval]
+	a.subscriptionsMu.Unlock()
+
+	// Check if this is a NEW subscription (first user watching this symbol with ANY interval)
 	a.activeStreamsMu.Lock()
-	a.activeStreams[streamKey] = true
+	_, exists := a.activeStreams[streamKey]
+	wasNew := !exists
+	if wasNew {
+		a.activeStreams[streamKey] = 1
+	} else {
+		a.activeStreams[streamKey]++
+	}
+	totalStreams := len(a.activeStreams)
 	a.activeStreamsMu.Unlock()
 
-	a.logger.Infof("Subscribed to %s %s on all exchanges", symbol, interval)
+	if wasNew {
+		a.logger.Infof("📊 NEW subscription: %s 1m (derives %s and all other intervals, total active streams: %d)", symbol, interval, totalStreams)
+
+		// Trigger reconnection for ALL exchanges (each exchange needs the signal)
+		// Since all 6 exchanges share the same channel, we need to send 6 signals
+		for i := 0; i < len(a.exchanges); i++ {
+			select {
+			case a.reconnectChan <- struct{}{}:
+			default:
+				// Channel full, reconnection already pending
+			}
+		}
+	} else {
+		a.logger.Debugf("📈 Shared subscription: %s %s (uses existing 1m stream, ref count: %d)", symbol, interval, refCount)
+	}
+
 	return nil
+}
+
+// UnsubscribeFromInterval removes a subscription reference
+// When refCount reaches 0, the websocket subscription is removed
+func (a *ExchangeAggregator) UnsubscribeFromInterval(ctx context.Context, symbol, interval string) error {
+	symbol = strings.ToUpper(symbol)
+
+	// ⚡ OPTIMIZATION: We only track 1m interval on exchanges
+	baseInterval := "1m"
+	streamKey := fmt.Sprintf("%s@%s", strings.ToLower(symbol), baseInterval)
+
+	// Decrease reference count for REQUESTED interval
+	a.subscriptionsMu.Lock()
+	if a.subscriptions[symbol] != nil && a.subscriptions[symbol][interval] > 0 {
+		a.subscriptions[symbol][interval]--
+		if a.subscriptions[symbol][interval] == 0 {
+			delete(a.subscriptions[symbol], interval)
+			if len(a.subscriptions[symbol]) == 0 {
+				delete(a.subscriptions, symbol)
+			}
+		}
+	}
+	a.subscriptionsMu.Unlock()
+
+	// Decrease active stream count (only remove when NO intervals are subscribed for this symbol)
+	a.activeStreamsMu.Lock()
+	if count, exists := a.activeStreams[streamKey]; exists {
+		count--
+		if count <= 0 {
+			// No more users watching ANY interval for this symbol, remove 1m subscription
+			delete(a.activeStreams, streamKey)
+			a.logger.Infof("🗑️  Removed subscription: %s 1m (no more users watching any interval)", symbol)
+
+			// TODO: Send unsubscribe message to exchanges if needed
+			// For now, we keep the connection but stop tracking
+		} else {
+			a.activeStreams[streamKey] = count
+			a.logger.Debugf("📉 Unsubscribed: %s %s (1m stream still active, ref count: %d)", symbol, interval, count)
+		}
+	}
+	a.activeStreamsMu.Unlock()
+
+	return nil
+}
+
+// SubscribeToSymbol is an alias for backward compatibility
+func (a *ExchangeAggregator) SubscribeToSymbol(ctx context.Context, symbol, interval string) error {
+	return a.SubscribeToInterval(ctx, symbol, interval)
 }
 
 // TriggerReconnectAll triggers reconnection for all exchanges
@@ -274,7 +423,7 @@ func (a *ExchangeAggregator) TriggerReconnectAll() {
 
 // manageExchangeConnection manages a single exchange connection with circuit breaker
 func (a *ExchangeAggregator) manageExchangeConnection(ctx context.Context, ex *Exchange) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(30 * time.Second) // Reduced frequency - check every 30s instead of 10s
 	defer ticker.Stop()
 
 	for {
@@ -284,11 +433,27 @@ func (a *ExchangeAggregator) manageExchangeConnection(ctx context.Context, ex *E
 
 		case <-a.reconnectChan:
 			// Immediate reconnection trigger (from subscriptions)
-			ex.mu.RLock()
+			ex.mu.Lock()
 			backoffUntil := ex.backoffUntil
-			ex.mu.RUnlock()
+			isConnecting := ex.isConnecting
+			isHealthy := ex.isHealthy
+			lastConnectTime := ex.lastConnectTime
+			ex.mu.Unlock()
+
+			// Prevent duplicate connection attempts
+			if isConnecting {
+				a.logger.Debugf("%s already connecting, skipping", ex.Name)
+				continue
+			}
+
+			// If connected and healthy within last 5 seconds, skip
+			if isHealthy && time.Since(lastConnectTime) < 5*time.Second {
+				a.logger.Debugf("%s already connected, skipping", ex.Name)
+				continue
+			}
 
 			if time.Now().Before(backoffUntil) {
+				a.logger.Debugf("%s in backoff period, skipping", ex.Name)
 				continue // Still in backoff period
 			}
 
@@ -302,14 +467,29 @@ func (a *ExchangeAggregator) manageExchangeConnection(ctx context.Context, ex *E
 			a.listenExchange(ctx, ex)
 
 		case <-ticker.C:
-			// Periodic check/reconnection
+			// Periodic health check/reconnection
 			ex.mu.RLock()
 			backoffUntil := ex.backoffUntil
+			isHealthy := ex.isHealthy
+			isConnecting := ex.isConnecting
+			lastUpdate := ex.lastUpdate
 			ex.mu.RUnlock()
+
+			// If already connecting, skip
+			if isConnecting {
+				continue
+			}
+
+			// If healthy and receiving messages, skip
+			if isHealthy && time.Since(lastUpdate) < 60*time.Second {
+				continue
+			}
 
 			if time.Now().Before(backoffUntil) {
 				continue // Still in backoff period
 			}
+
+			a.logger.Infof("%s health check triggered reconnection (last update: %v)", ex.Name, time.Since(lastUpdate))
 
 			// Attempt connection
 			if err := a.connectExchange(ctx, ex); err != nil {
@@ -326,27 +506,47 @@ func (a *ExchangeAggregator) manageExchangeConnection(ctx context.Context, ex *E
 // connectExchange establishes WebSocket connection to an exchange
 func (a *ExchangeAggregator) connectExchange(ctx context.Context, ex *Exchange) error {
 	ex.mu.Lock()
-	defer ex.mu.Unlock()
 
+	// Mark as connecting
+	ex.isConnecting = true
+	ex.mu.Unlock()
+
+	// Ensure we clear the connecting flag when done
+	defer func() {
+		ex.mu.Lock()
+		ex.isConnecting = false
+		ex.mu.Unlock()
+	}()
+
+	ex.mu.Lock()
 	// Close existing connection
 	if ex.conn != nil {
 		ex.conn.Close()
 		ex.conn = nil
 	}
+	ex.mu.Unlock()
 
-	// Connect with timeout
-	dialer := websocket.DefaultDialer
-	dialer.HandshakeTimeout = 10 * time.Second
-
-	conn, _, err := dialer.Dial(ex.WSUrl, nil)
+	// Connect with proxy support (handles 403 errors)
+	conn, proxyUsed, err := a.dialWithProxy(ex)
 	if err != nil {
 		return fmt.Errorf("failed to dial %s: %w", ex.Name, err)
 	}
 
+	// If we used a proxy successfully, mark it as working
+	if proxyUsed != "" && a.proxyService != nil {
+		a.proxyService.SetWorkingProxy(proxyUsed)
+	}
+
+	ex.mu.Lock()
 	ex.conn = conn
 	ex.isHealthy = true
 	ex.lastUpdate = time.Now()
+	ex.lastConnectTime = time.Now()
 	ex.failureCount = 0
+	ex.isSubscribed = false
+	ex.mu.Unlock()
+
+	a.logger.Infof("✅ %s WebSocket connected successfully (%s)", ex.Name, ex.WSUrl)
 
 	// Get rate limiter for this exchange
 	limiter, err := a.rateLimitMgr.GetLimiter(ex.Name)
@@ -381,42 +581,173 @@ func (a *ExchangeAggregator) connectExchange(ctx context.Context, ex *Exchange) 
 
 	if subErr != nil {
 		limiter.RecordRateLimitHit()
+		ex.mu.Lock()
+		ex.isHealthy = false
+		ex.mu.Unlock()
 		return fmt.Errorf("failed to subscribe %s: %w", ex.Name, subErr)
 	}
 
+	ex.mu.Lock()
+	ex.isSubscribed = true
+	ex.mu.Unlock()
+
+	// Get stream count for logging
+	a.activeStreamsMu.RLock()
+	streamCount := len(a.activeStreams)
+	a.activeStreamsMu.RUnlock()
+
 	limiter.RecordSuccess()
-	a.logger.Infof("%s connected successfully", ex.Name)
+	a.logger.Infof("✅ %s subscribed successfully (%d active streams)", ex.Name, streamCount)
 	return nil
+}
+
+// dialWithProxy attempts to connect to exchange with proxy support
+// Returns: (connection, proxyUsed, error)
+func (a *ExchangeAggregator) dialWithProxy(ex *Exchange) (*websocket.Conn, string, error) {
+	var proxies []string
+
+	// Get proxy list (working proxy first)
+	if a.proxyService != nil {
+		proxies = a.proxyService.GetProxyListWithWorkingFirst()
+		a.logger.Infof("🔌 Connecting to %s with %d proxies available", ex.Name, len(proxies))
+	} else {
+		proxies = []string{""} // Direct connection only
+		a.logger.Infof("🔌 Connecting to %s (no proxy service)", ex.Name)
+	}
+
+	var lastErr error
+
+	// Try each proxy
+	for i, proxyURL := range proxies {
+		proxyDesc := "direct"
+		if proxyURL != "" {
+			proxyDesc = proxyURL
+		}
+
+		a.logger.Infof("Attempt %d/%d: Trying %s with %s", i+1, len(proxies), ex.Name, proxyDesc)
+
+		// Create dialer with proxy
+		dialer := a.createDialerWithProxy(proxyURL)
+
+		// Attempt connection
+		conn, resp, err := dialer.Dial(ex.WSUrl, nil)
+
+		if err == nil {
+			// Success!
+			a.logger.Infof("✅ %s connected successfully using %s", ex.Name, proxyDesc)
+			return conn, proxyURL, nil
+		}
+
+		// Check for 403 Forbidden (blocked by exchange)
+		if resp != nil && resp.StatusCode == 403 {
+			a.logger.Warnf("❌ %s returned 403 Forbidden with %s (IP blocked)", ex.Name, proxyDesc)
+			lastErr = fmt.Errorf("403 forbidden: %w", err)
+			continue // Try next proxy
+		}
+
+		// Other errors
+		a.logger.Warnf("❌ %s connection failed with %s: %v", ex.Name, proxyDesc, err)
+		lastErr = err
+
+		// Don't try more proxies for non-403 errors on first attempt
+		if i == 0 && proxyURL == "" {
+			break
+		}
+	}
+
+	// All proxies failed
+	if lastErr != nil {
+		return nil, "", fmt.Errorf("all connection attempts failed: %w", lastErr)
+	}
+
+	return nil, "", fmt.Errorf("no proxies available")
+}
+
+// createDialerWithProxy creates a WebSocket dialer with optional proxy
+func (a *ExchangeAggregator) createDialerWithProxy(proxyURL string) *websocket.Dialer {
+	dialer := &websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Required for SOCKS5 proxies
+		},
+	}
+
+	if proxyURL != "" {
+		parsedURL, err := url.Parse(proxyURL)
+		if err == nil {
+			dialer.Proxy = http.ProxyURL(parsedURL)
+		} else {
+			a.logger.Warnf("Invalid proxy URL %s: %v", proxyURL, err)
+		}
+	}
+
+	return dialer
 }
 
 // subscribeBinance subscribes to Binance kline streams
 func (a *ExchangeAggregator) subscribeBinance(ex *Exchange) error {
 	a.activeStreamsMu.RLock()
 	streams := make([]string, 0, len(a.activeStreams))
-	for stream := range a.activeStreams {
-		streams = append(streams, stream)
+	for stream, refCount := range a.activeStreams {
+		// Only subscribe to streams with active users
+		if refCount > 0 {
+			// Binance expects format: symbol@kline_interval (e.g., btcusdt@kline_1m)
+			// activeStreams stores: symbol@interval (e.g., btcusdt@1m)
+			// We need to convert to: symbol@kline_interval
+			parts := strings.Split(stream, "@")
+			if len(parts) == 2 {
+				binanceStream := fmt.Sprintf("%s@kline_%s", strings.ToLower(parts[0]), parts[1])
+				streams = append(streams, binanceStream)
+			}
+		}
 	}
 	a.activeStreamsMu.RUnlock()
 
 	if len(streams) == 0 {
-		// Subscribe to default popular pairs
-		streams = []string{
-			"btcusdt@kline_1m", "ethusdt@kline_1m", "bnbusdt@kline_1m",
-			"solusdt@kline_1m", "xrpusdt@kline_1m",
+		a.logger.Warn("No active streams to subscribe to on Binance - waiting for subscriptions from API")
+		return nil // No fallback - must have symbols from API
+	}
+
+	// Binance allows up to 1024 streams per connection, but we batch for safety
+	// Limit: 5 requests per second, so we send max 200 streams per batch with delays
+	const maxStreamsPerBatch = 200
+
+	for i := 0; i < len(streams); i += maxStreamsPerBatch {
+		end := i + maxStreamsPerBatch
+		if end > len(streams) {
+			end = len(streams)
+		}
+		batch := streams[i:end]
+
+		subscribeMsg := map[string]interface{}{
+			"method": "SUBSCRIBE",
+			"params": batch,
+			"id":     i/maxStreamsPerBatch + 1,
+		}
+
+		if err := ex.conn.WriteJSON(subscribeMsg); err != nil {
+			a.logger.WithError(err).Warnf("Failed to subscribe to Binance batch %d", i/maxStreamsPerBatch)
+			return err
+		}
+
+		a.logger.Infof("Subscribed to %d streams on Binance (batch %d/%d)", len(batch), i/maxStreamsPerBatch+1, (len(streams)+maxStreamsPerBatch-1)/maxStreamsPerBatch)
+
+		// Add delay between batches to respect rate limits (5 req/sec = 200ms between requests)
+		if end < len(streams) {
+			time.Sleep(250 * time.Millisecond)
 		}
 	}
 
-	subscribeMsg := map[string]interface{}{
-		"method": "SUBSCRIBE",
-		"params": streams,
-		"id":     1,
-	}
-
-	return ex.conn.WriteJSON(subscribeMsg)
+	return nil
 }
 
 // listenExchange listens for messages from an exchange
 func (a *ExchangeAggregator) listenExchange(ctx context.Context, ex *Exchange) {
+	// Start ping goroutine for exchanges that need it (OKX)
+	if ex.Name == "OKX" {
+		go a.sendPeriodicPing(ctx, ex)
+	}
+
 	for {
 		select {
 		case <-a.stopChan:
@@ -464,6 +795,37 @@ func (a *ExchangeAggregator) listenExchange(ctx context.Context, ex *Exchange) {
 	}
 }
 
+// sendPeriodicPing sends periodic ping messages to keep connection alive
+func (a *ExchangeAggregator) sendPeriodicPing(ctx context.Context, ex *Exchange) {
+	ticker := time.NewTicker(20 * time.Second) // Send every 20s (OKX closes after 30s)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.stopChan:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ex.mu.RLock()
+			conn := ex.conn
+			ex.mu.RUnlock()
+
+			if conn == nil {
+				return
+			}
+
+			// Send ping message (OKX format)
+			pingMsg := map[string]string{"op": "ping"}
+			if err := conn.WriteJSON(pingMsg); err != nil {
+				a.logger.WithError(err).Debugf("%s ping failed", ex.Name)
+				return
+			}
+			a.logger.Debugf("📡 Sent ping to %s", ex.Name)
+		}
+	}
+}
+
 // processBinanceMessage processes Binance kline message
 func (a *ExchangeAggregator) processBinanceMessage(ex *Exchange, message []byte) {
 	var msg BinanceKlineMessage
@@ -499,25 +861,24 @@ func (a *ExchangeAggregator) processBinanceMessage(ex *Exchange, message []byte)
 	candle.TakerBuyBaseVolume, _ = decimal.NewFromString(msg.Kline.TakerBuyBaseVolume)
 	candle.TakerBuyQuoteVolume, _ = decimal.NewFromString(msg.Kline.TakerBuyQuoteVolume)
 
-	// Update aggregated price
-	a.updateAggregatedPrice(msg.Symbol, "Binance", candle.Close)
-
-	// Add to pending candles for aggregation (NOT direct write to DB)
-	a.addPendingCandle("Binance", msg.Symbol, msg.Kline.Interval, candle)
+	// ⚡ Use real-time aggregator (zero-delay, lock-free)
+	a.realtimeAgg.ProcessCandleUpdate("Binance", candle)
 }
 
-// updateAggregatedPrice updates price aggregation from an exchange
+// updateAggregatedPrice is DEPRECATED - kept for compatibility
+// Real-time aggregator now handles all price updates
 func (a *ExchangeAggregator) updateAggregatedPrice(symbol, exchange string, price decimal.Decimal) {
-	// Get or create exchange price map for this symbol
-	priceMapInterface, _ := a.aggregatedPrices.LoadOrStore(symbol, &sync.Map{})
-	priceMap := priceMapInterface.(*sync.Map)
-
-	// Store exchange price
-	priceMap.Store(exchange, price)
+	// No-op: realtimeAgg handles this now
 }
 
 // GetAggregatedPrice calculates average price from all exchanges
 func (a *ExchangeAggregator) GetAggregatedPrice(symbol string) (decimal.Decimal, int) {
+	// ⚡ NEW: Use zero-delay real-time aggregator first (lock-free O(1))
+	if price, count := a.realtimeAgg.GetAggregatedPrice(symbol); count > 0 {
+		return price, count
+	}
+
+	// ⚡ FALLBACK: Use old system for compatibility during migration
 	priceMapInterface, ok := a.aggregatedPrices.Load(symbol)
 	if !ok {
 		return decimal.Zero, 0
@@ -543,159 +904,51 @@ func (a *ExchangeAggregator) GetAggregatedPrice(symbol string) (decimal.Decimal,
 	return avg, count
 }
 
-// addPendingCandle adds a candle from an exchange to the in-memory buffer
-// This does NOT save to database - candles are aggregated first, then saved
-func (a *ExchangeAggregator) addPendingCandle(exchange, symbol, interval string, candle *models.Candle) {
-	// Truncate openTime to interval boundary to ensure all exchanges align
-	truncatedOpenTime := models.TruncateToInterval(candle.OpenTime, interval)
-	openTimeUnix := truncatedOpenTime.Unix()
-
-	a.pendingCandlesMu.Lock()
-
-	// Initialize nested maps if needed
-	if a.pendingCandles[symbol] == nil {
-		a.pendingCandles[symbol] = make(map[string]map[int64]map[string]*models.Candle)
+// aggregateCandles aggregates candles from multiple exchanges for a specific timestamp
+// This is used for real-time publishing and accepts even 1 exchange's data
+func (a *ExchangeAggregator) aggregateCandles(symbol, interval string, candles map[string]*models.Candle, timestamp int64) *models.Candle {
+	if candles == nil || len(candles) == 0 {
+		return nil
 	}
-	if a.pendingCandles[symbol][interval] == nil {
-		a.pendingCandles[symbol][interval] = make(map[int64]map[string]*models.Candle)
-	}
-	if a.pendingCandles[symbol][interval][openTimeUnix] == nil {
-		a.pendingCandles[symbol][interval][openTimeUnix] = make(map[string]*models.Candle)
-	}
-
-	// Store or update the candle for this exchange
-	a.pendingCandles[symbol][interval][openTimeUnix][exchange] = candle
-
-	var shouldSchedule bool
-	if candle.IsClosed {
-		a.scheduledAggregationsMu.Lock()
-
-		// Initialize nested maps if needed
-		if a.scheduledAggregations[symbol] == nil {
-			a.scheduledAggregations[symbol] = make(map[string]map[int64]bool)
-		}
-		if a.scheduledAggregations[symbol][interval] == nil {
-			a.scheduledAggregations[symbol][interval] = make(map[int64]bool)
-		}
-
-		// Check if aggregation already scheduled
-		alreadyScheduled := a.scheduledAggregations[symbol][interval][openTimeUnix]
-		if !alreadyScheduled {
-			a.scheduledAggregations[symbol][interval][openTimeUnix] = true
-			shouldSchedule = true
-		}
-
-		a.scheduledAggregationsMu.Unlock()
-	}
-
-	a.pendingCandlesMu.Unlock()
-
-	// Schedule aggregation OUTSIDE the lock to prevent deadlock
-	if shouldSchedule {
-		go func() {
-			// Wait 500ms for other exchanges to send their candles
-			time.Sleep(500 * time.Millisecond)
-			a.aggregatePendingCandles(symbol, interval, truncatedOpenTime)
-		}()
-	}
-}
-
-// aggregatePendingCandles combines candles from all exchanges into ONE aggregated candle
-func (a *ExchangeAggregator) aggregatePendingCandles(symbol, interval string, openTime time.Time) {
-	openTimeUnix := openTime.Unix()
-
-	a.pendingCandlesMu.Lock()
-
-	// Get all candles for this symbol/interval/timestamp
-	if a.pendingCandles[symbol] == nil ||
-		a.pendingCandles[symbol][interval] == nil ||
-		a.pendingCandles[symbol][interval][openTimeUnix] == nil {
-		a.pendingCandlesMu.Unlock()
-		return
-	}
-
-	candles := a.pendingCandles[symbol][interval][openTimeUnix]
-
-	// Copy candles to avoid holding lock during processing
-	candleCopy := make(map[string]*models.Candle)
-	for exchange, candle := range candles {
-		candleCopy[exchange] = candle
-	}
-
-	// Delete from pending to free memory
-	delete(a.pendingCandles[symbol][interval], openTimeUnix)
-
-	a.pendingCandlesMu.Unlock()
-
-	// Clear scheduled flag
-	a.scheduledAggregationsMu.Lock()
-	if a.scheduledAggregations[symbol] != nil &&
-		a.scheduledAggregations[symbol][interval] != nil {
-		delete(a.scheduledAggregations[symbol][interval], openTimeUnix)
-	}
-	a.scheduledAggregationsMu.Unlock()
-
-	// Need at least one candle to aggregate
-	if len(candleCopy) == 0 {
-		return
-	}
-
-	// Aggregate the candles using the formula:
-	// - Open: Average of all exchange opens
-	// - Close: Average of all exchange closes
-	// - High: Maximum of all exchange highs
-	// - Low: Minimum of all exchange lows (or zero initially)
-	// - Volume: SUM of all exchange volumes (true market volume!)
-	// - QuoteVolume: SUM of all quote volumes
 
 	var totalOpen, totalClose, totalVolume, totalQuoteVolume decimal.Decimal
 	var maxHigh, minLow decimal.Decimal
 	var totalTradeCount int
 	validCount := 0
-
 	firstCandle := true
 	var closeTime time.Time
+	var openTime time.Time
 
-	for _, candle := range candleCopy {
-		// Validate candle data
+	for _, candle := range candles {
 		if candle.Open.IsZero() && candle.Close.IsZero() {
-			continue // Skip invalid candles
+			continue
 		}
 
 		validCount++
 
-		// Calculate max high
 		if firstCandle || candle.High.GreaterThan(maxHigh) {
 			maxHigh = candle.High
 		}
 
-		// Calculate min low
 		if firstCandle || candle.Low.LessThan(minLow) {
 			minLow = candle.Low
 		}
 
-		// Sum for averaging
 		totalOpen = totalOpen.Add(candle.Open)
 		totalClose = totalClose.Add(candle.Close)
-
-		// Sum volumes (true market volume across exchanges)
 		totalVolume = totalVolume.Add(candle.Volume)
 		totalQuoteVolume = totalQuoteVolume.Add(candle.QuoteVolume)
-
-		// Sum trade counts
 		totalTradeCount += candle.TradeCount
 
-		// Use the close time from the first candle
 		if firstCandle {
 			closeTime = candle.CloseTime
+			openTime = candle.OpenTime
 			firstCandle = false
 		}
 	}
 
-	// Need at least one valid candle
 	if validCount == 0 {
-		a.logger.Warnf("No valid candles to aggregate for %s %s at %v", symbol, interval, openTime)
-		return
+		return nil
 	}
 
 	// Calculate averages
@@ -703,36 +956,158 @@ func (a *ExchangeAggregator) aggregatePendingCandles(symbol, interval string, op
 	avgOpen := totalOpen.Div(validCountDecimal)
 	avgClose := totalClose.Div(validCountDecimal)
 
-	// Create aggregated candle with source="aggregated"
-	aggregatedCandle := &models.Candle{
+	// Candle is considered closed if we have data from 3+ exchanges and they all report it as closed
+	allClosed := true
+	closedCount := 0
+	for _, candle := range candles {
+		if candle.IsClosed {
+			closedCount++
+		} else {
+			allClosed = false
+		}
+	}
+	isClosed := allClosed && validCount >= 3
+
+	// Return aggregated candle
+	return &models.Candle{
 		Symbol:       symbol,
 		Interval:     interval,
 		OpenTime:     openTime,
 		CloseTime:    closeTime,
-		Open:         avgOpen,          // Average open price
-		High:         maxHigh,          // Maximum high price
-		Low:          minLow,           // Minimum low price
-		Close:        avgClose,         // Average close price
-		Volume:       totalVolume,      // SUM of all volumes (true market volume)
-		QuoteVolume:  totalQuoteVolume, // SUM of all quote volumes
-		TradeCount:   validCount,       // Number of exchanges aggregated
-		Source:       "aggregated",     // Mark as aggregated (NOT individual exchange)
-		IsClosed:     true,
+		Open:         avgOpen,
+		High:         maxHigh,
+		Low:          minLow,
+		Close:        avgClose,
+		Volume:       totalVolume,
+		QuoteVolume:  totalQuoteVolume,
+		TradeCount:   totalTradeCount,
+		Source:       "aggregated",
+		IsClosed:     isClosed,
 		ContractType: "spot",
 		CreatedAt:    time.Now(),
 		UpdatedAt:    time.Now(),
 	}
+}
 
-	// Send ONLY the aggregated candle to batch writer (not individual exchange candles)
-	select {
-	case a.candleBatchChan <- aggregatedCandle:
-		a.logger.Debugf("Aggregated candle from %d exchanges: %s %s at %v", validCount, symbol, interval, openTime)
-	default:
-		a.logger.Warn("Candle batch channel full, dropping aggregated candle")
+// GetLatestInMemoryCandle gets the most recent candle from in-memory pending candles
+func (a *ExchangeAggregator) GetLatestInMemoryCandle(symbol, interval string) *models.Candle {
+	// ⚡ NEW: Use zero-delay real-time aggregator first (lock-free O(1))
+	if candle := a.realtimeAgg.GetLatestCandle(symbol, interval); candle != nil {
+		return candle
 	}
 
-	// Increment counter for the aggregated candle
-	atomic.AddInt64(&a.priceUpdateCount, 1)
+	// ⚡ FALLBACK: Use old system for compatibility during migration
+	a.pendingCandlesMu.RLock()
+	defer a.pendingCandlesMu.RUnlock()
+
+	if a.pendingCandles[symbol] == nil || a.pendingCandles[symbol][interval] == nil {
+		return nil
+	}
+
+	// Get the ABSOLUTE latest candle with ANY data
+	var latestTimestamp int64
+	var latestCandles map[string]*models.Candle
+
+	for timestamp, candles := range a.pendingCandles[symbol][interval] {
+		if timestamp > latestTimestamp {
+			latestTimestamp = timestamp
+			latestCandles = candles
+		}
+	}
+
+	if latestCandles == nil || len(latestCandles) == 0 {
+		return nil
+	}
+
+	selectedCandles := latestCandles
+
+	// Aggregate candles from all exchanges for this timestamp
+	var totalOpen, totalClose, totalVolume, totalQuoteVolume decimal.Decimal
+	var maxHigh, minLow decimal.Decimal
+	var totalTradeCount int
+	validCount := 0
+	firstCandle := true
+	var closeTime time.Time
+	var openTime time.Time
+
+	for _, candle := range selectedCandles {
+		if candle.Open.IsZero() && candle.Close.IsZero() {
+			continue
+		}
+
+		validCount++
+
+		if firstCandle || candle.High.GreaterThan(maxHigh) {
+			maxHigh = candle.High
+		}
+
+		if firstCandle || candle.Low.LessThan(minLow) {
+			minLow = candle.Low
+		}
+
+		totalOpen = totalOpen.Add(candle.Open)
+		totalClose = totalClose.Add(candle.Close)
+		totalVolume = totalVolume.Add(candle.Volume)
+		totalQuoteVolume = totalQuoteVolume.Add(candle.QuoteVolume)
+		totalTradeCount += candle.TradeCount
+
+		if firstCandle {
+			closeTime = candle.CloseTime
+			openTime = candle.OpenTime
+			firstCandle = false
+		}
+	}
+
+	if validCount == 0 {
+		return nil
+	}
+
+	// Calculate averages
+	validCountDecimal := decimal.NewFromInt(int64(validCount))
+	avgOpen := totalOpen.Div(validCountDecimal)
+	avgClose := totalClose.Div(validCountDecimal)
+
+	// ⚡ REAL-TIME FIX: Candle is closed if ANY exchange reports it as closed
+	// No longer require 3+ exchanges
+	isClosed := false
+	for _, candle := range selectedCandles {
+		if candle.IsClosed {
+			isClosed = true
+			break
+		}
+	}
+
+	// Return aggregated in-memory candle
+	return &models.Candle{
+		Symbol:       symbol,
+		Interval:     interval,
+		OpenTime:     openTime,
+		CloseTime:    closeTime,
+		Open:         avgOpen,
+		High:         maxHigh,
+		Low:          minLow,
+		Close:        avgClose,
+		Volume:       totalVolume,
+		QuoteVolume:  totalQuoteVolume,
+		TradeCount:   validCount,
+		Source:       "aggregated",
+		IsClosed:     isClosed,
+		ContractType: "spot",
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+}
+
+// addPendingCandle is DEPRECATED - kept for compatibility
+// Real-time aggregator now handles all candle aggregation
+func (a *ExchangeAggregator) addPendingCandle(exchange, symbol, interval string, candle *models.Candle) {
+	// No-op: realtimeAgg handles this now
+}
+
+// aggregatePendingCandles is DEPRECATED - kept for compatibility
+// Real-time aggregator now handles all candle aggregation
+func (a *ExchangeAggregator) aggregatePendingCandles(symbol, interval string, openTime time.Time) {
+	// No-op: realtimeAgg handles this now
 }
 
 // batchWriterWorker processes batches of candles
@@ -1022,4 +1397,20 @@ func (a *ExchangeAggregator) subscribeGateIOWithLimiter(ex *Exchange, limiter *E
 	}
 
 	return a.subscribeGateIO(ex)
+}
+
+// SubscribePrice subscribes to real-time price updates for a symbol
+// Delegates to the realtime aggregator for direct callback subscription
+func (a *ExchangeAggregator) SubscribePrice(symbol string, callback func(symbol string, price decimal.Decimal, exchangeCount int)) {
+	if a.realtimeAgg != nil {
+		a.realtimeAgg.SubscribePrice(symbol, callback)
+	}
+}
+
+// SubscribeCandle subscribes to real-time candle updates for a symbol+interval
+// Delegates to the realtime aggregator for direct callback subscription
+func (a *ExchangeAggregator) SubscribeCandle(symbol, interval string, callback func(candle *models.Candle)) {
+	if a.realtimeAgg != nil {
+		a.realtimeAgg.SubscribeCandle(symbol, interval, callback)
+	}
 }

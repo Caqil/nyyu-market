@@ -12,14 +12,26 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// SymbolResponse represents the API response for available symbols
-type SymbolResponse struct {
-	Status  string `json:"status"`
+// BackendTradeSymbolsResponse represents backend trade API response
+type BackendTradeSymbolsResponse struct {
+	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Data    struct {
-		Symbols []string `json:"symbols"`
 		Count   int      `json:"count"`
+		Symbols []string `json:"symbols"`
 	} `json:"data"`
+}
+
+// BinanceExchangeInfo represents Binance exchangeInfo API response
+type BinanceExchangeInfo struct {
+	Timezone   string `json:"timezone"`
+	ServerTime int64  `json:"serverTime"`
+	Symbols    []struct {
+		Symbol     string `json:"symbol"`
+		Status     string `json:"status"`
+		BaseAsset  string `json:"baseAsset"`
+		QuoteAsset string `json:"quoteAsset"`
+	} `json:"symbols"`
 }
 
 // SymbolFetcher fetches and caches available symbols from Binance API
@@ -42,11 +54,20 @@ func NewSymbolFetcher(apiURL string, logger *logrus.Logger) *SymbolFetcher {
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		// Default fallback symbols in case API is down
-		symbols: []string{
-			"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-			"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
+		symbols: DefaultSymbols, // Use curated default list
+	}
+}
+
+// NewSymbolFetcherWithSymbols creates a new symbol fetcher with custom symbols
+func NewSymbolFetcherWithSymbols(apiURL string, customSymbols []string, logger *logrus.Logger) *SymbolFetcher {
+	return &SymbolFetcher{
+		apiURL:   apiURL,
+		cacheTTL: 1 * time.Hour,
+		logger:   logger,
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
 		},
+		symbols: customSymbols, // Use provided symbols
 	}
 }
 
@@ -81,52 +102,58 @@ func (f *SymbolFetcher) GetPopularSymbols(ctx context.Context, limit int) ([]str
 	return symbols[:limit], nil
 }
 
-// FetchSymbols fetches symbols from the API
+// FetchSymbols fetches symbols from backend trade API
 func (f *SymbolFetcher) FetchSymbols(ctx context.Context) ([]string, error) {
-	f.logger.Info("Fetching available symbols from Binance API...")
+	f.logger.Info("Fetching available symbols from backend trade API...")
 
 	req, err := http.NewRequestWithContext(ctx, "GET", f.apiURL, nil)
 	if err != nil {
-		return f.getFallbackSymbols(), fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	resp, err := f.httpClient.Do(req)
 	if err != nil {
-		f.logger.WithError(err).Warn("Failed to fetch symbols, using cached/fallback")
-		return f.getFallbackSymbols(), nil
+		f.logger.WithError(err).Error("Failed to fetch symbols from backend trade API")
+		return f.getCachedSymbols(), fmt.Errorf("failed to fetch symbols: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		f.logger.Warnf("Symbols API returned status %d, using cached/fallback", resp.StatusCode)
-		return f.getFallbackSymbols(), nil
+		f.logger.Errorf("Backend trade API returned status %d", resp.StatusCode)
+		return f.getCachedSymbols(), fmt.Errorf("backend API returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		f.logger.WithError(err).Warn("Failed to read response body, using cached/fallback")
-		return f.getFallbackSymbols(), nil
+		f.logger.WithError(err).Error("Failed to read response body")
+		return f.getCachedSymbols(), fmt.Errorf("failed to read response: %w", err)
 	}
 
-	var symbolResp SymbolResponse
-	if err := json.Unmarshal(body, &symbolResp); err != nil {
-		f.logger.WithError(err).Warn("Failed to parse symbols response, using cached/fallback")
-		return f.getFallbackSymbols(), nil
+	var symbolsResp BackendTradeSymbolsResponse
+	if err := json.Unmarshal(body, &symbolsResp); err != nil {
+		f.logger.WithError(err).Error("Failed to parse backend trade response")
+		return f.getCachedSymbols(), fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	if symbolResp.Status != "success" || len(symbolResp.Data.Symbols) == 0 {
-		f.logger.Warn("Invalid symbols response, using cached/fallback")
-		return f.getFallbackSymbols(), nil
+	if !symbolsResp.Success {
+		f.logger.Errorf("Backend trade API returned error: %s", symbolsResp.Message)
+		return f.getCachedSymbols(), fmt.Errorf("backend API error: %s", symbolsResp.Message)
+	}
+
+	symbols := symbolsResp.Data.Symbols
+	if len(symbols) == 0 {
+		f.logger.Error("No symbols found in backend trade response")
+		return f.getCachedSymbols(), fmt.Errorf("no symbols found")
 	}
 
 	// Update cache
 	f.mu.Lock()
-	f.symbols = symbolResp.Data.Symbols
+	f.symbols = symbols
 	f.lastFetch = time.Now()
 	f.mu.Unlock()
 
-	f.logger.Infof("Successfully fetched %d symbols from Binance API", len(symbolResp.Data.Symbols))
-	return symbolResp.Data.Symbols, nil
+	f.logger.Infof("Successfully fetched %d symbols from backend trade API", len(symbols))
+	return symbols, nil
 }
 
 // RefreshSymbols forces a refresh of the symbol cache
@@ -158,10 +185,14 @@ func (f *SymbolFetcher) StartAutoRefresh(ctx context.Context) {
 	}
 }
 
-// getFallbackSymbols returns cached or default fallback symbols
-func (f *SymbolFetcher) getFallbackSymbols() []string {
+// getCachedSymbols returns cached symbols only (no defaults)
+func (f *SymbolFetcher) getCachedSymbols() []string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+
+	if len(f.symbols) == 0 {
+		return []string{} // Return empty, no fallback
+	}
 
 	symbols := make([]string, len(f.symbols))
 	copy(symbols, f.symbols)

@@ -9,7 +9,6 @@ import (
 	"nyyu-market/internal/config"
 	candleService "nyyu-market/internal/services/candle"
 	markpriceService "nyyu-market/internal/services/markprice"
-	priceService "nyyu-market/internal/services/price"
 	"nyyu-market/internal/services/symbols"
 	pb "nyyu-market/proto/marketpb"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
 
@@ -24,7 +24,6 @@ type Server struct {
 	pb.UnimplementedMarketServiceServer
 	config        *config.Config
 	candleSvc     *candleService.Service
-	priceSvc      *priceService.Service
 	markPriceSvc  *markpriceService.Service
 	symbolFetcher *symbols.SymbolFetcher
 	redisClient   *redis.Client
@@ -36,7 +35,6 @@ type Server struct {
 func NewServer(
 	cfg *config.Config,
 	candleSvc *candleService.Service,
-	priceSvc *priceService.Service,
 	markPriceSvc *markpriceService.Service,
 	symbolFetcher *symbols.SymbolFetcher,
 	redisClient *redis.Client,
@@ -45,7 +43,6 @@ func NewServer(
 	return &Server{
 		config:        cfg,
 		candleSvc:     candleSvc,
-		priceSvc:      priceSvc,
 		markPriceSvc:  markPriceSvc,
 		symbolFetcher: symbolFetcher,
 		redisClient:   redisClient,
@@ -60,10 +57,41 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	// Create gRPC server with options
+	// ⚡ PRODUCTION TUNING: Optimized for high concurrency (100k+ users)
 	opts := []grpc.ServerOption{
+		// Message size limits (already set)
 		grpc.MaxRecvMsgSize(100 * 1024 * 1024), // 100MB
 		grpc.MaxSendMsgSize(100 * 1024 * 1024), // 100MB
+
+		// ⚡ NEW: Concurrent streams limit
+		// Allows 50,000 concurrent streaming connections per server
+		// For 100k users, deploy 2-4 servers (25k-50k streams each)
+		grpc.MaxConcurrentStreams(50000),
+
+		// ⚡ NEW: Keepalive parameters
+		// Prevents connection timeouts and detects dead clients
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionAge:      30 * time.Minute, // Force reconnect after 30min (load balancing)
+			MaxConnectionAgeGrace: 5 * time.Minute,  // Allow 5min for graceful close
+			Time:                  20 * time.Second, // Send keepalive ping every 20s
+			Timeout:               10 * time.Second, // Wait 10s for ping response
+		}),
+
+		// ⚡ NEW: Keepalive enforcement
+		// Protect against aggressive clients
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second, // Min time between client pings
+			PermitWithoutStream: true,            // Allow pings without active streams
+		}),
+
+		// ⚡ NEW: Write buffer size
+		// Larger buffer = better throughput for streaming
+		grpc.WriteBufferSize(256 * 1024), // 256KB (default 32KB)
+
+		// ⚡ NEW: Read buffer size
+		grpc.ReadBufferSize(256 * 1024), // 256KB (default 32KB)
+
+		// Interceptors for logging and error handling
 		grpc.UnaryInterceptor(s.unaryInterceptor),
 		grpc.StreamInterceptor(s.streamInterceptor),
 	}
@@ -71,7 +99,7 @@ func (s *Server) Start() error {
 	s.grpcServer = grpc.NewServer(opts...)
 	pb.RegisterMarketServiceServer(s.grpcServer, s)
 
-	s.logger.Infof("gRPC server listening on :%d", s.config.Server.GRPCPort)
+	s.logger.Infof("🚀 gRPC server listening on :%d (MaxConcurrentStreams: 50000)", s.config.Server.GRPCPort)
 
 	return s.grpcServer.Serve(lis)
 }

@@ -38,15 +38,10 @@ func (s *Server) GetMarkPrices(ctx context.Context, req *pb.GetMarkPricesRequest
 	if len(symbols) == 0 {
 		popularSymbols, err := s.symbolFetcher.GetPopularSymbols(ctx, 10)
 		if err != nil {
-			s.logger.WithError(err).Warn("Failed to fetch popular symbols, using defaults")
-			// Fallback to defaults
-			symbols = []string{
-				"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-				"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
-			}
-		} else {
-			symbols = popularSymbols
+			s.logger.WithError(err).Error("Failed to fetch popular symbols")
+			return nil, status.Error(codes.Internal, "failed to fetch symbols from API")
 		}
+		symbols = popularSymbols
 	}
 
 	markPrices := make([]*pb.MarkPrice, 0, len(symbols))
@@ -91,15 +86,10 @@ func (s *Server) SubscribeMarkPrices(req *pb.SubscribeMarkPricesRequest, stream 
 		ctx := stream.Context()
 		popularSymbols, err := s.symbolFetcher.GetPopularSymbols(ctx, 10)
 		if err != nil {
-			s.logger.WithError(err).Warn("Failed to fetch popular symbols, using defaults")
-			// Fallback to defaults
-			symbols = []string{
-				"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-				"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
-			}
-		} else {
-			symbols = popularSymbols
+			s.logger.WithError(err).Error("Failed to fetch popular symbols")
+			return status.Error(codes.Internal, "failed to fetch symbols from API")
 		}
+		symbols = popularSymbols
 	}
 
 	s.logger.Infof("Client subscribed to mark prices for %d symbols", len(symbols))

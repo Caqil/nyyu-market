@@ -104,6 +104,11 @@ if [ -d "migrations" ]; then
     cp -r migrations "$TEMP_DIR/"
 fi
 
+# Copy static files if exists
+if [ -d "static" ]; then
+    cp -r static "$TEMP_DIR/"
+fi
+
 echo -e "${GREEN}✅ Files prepared${NC}"
 
 ###############################################################################
@@ -129,6 +134,12 @@ scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/.env.example" "$SERV
 if [ -d "$TEMP_DIR/migrations" ]; then
     echo "Uploading migrations..."
     scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C -r "$TEMP_DIR/migrations" "$SERVER:$REMOTE_DIR/"
+fi
+
+# Upload static files if exists
+if [ -d "$TEMP_DIR/static" ]; then
+    echo "Uploading static files (dashboard UI)..."
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C -r "$TEMP_DIR/static" "$SERVER:$REMOTE_DIR/"
 fi
 
 echo -e "${GREEN}✅ Files uploaded${NC}"
@@ -369,7 +380,7 @@ sudo mv /tmp/cloudflare.key /etc/nginx/ssl/$DOMAIN.key
 sudo chmod 644 /etc/nginx/ssl/$DOMAIN.crt
 sudo chmod 600 /etc/nginx/ssl/$DOMAIN.key
 
-# Update Nginx config for HTTPS
+# Update Nginx config for HTTPS with Cloudflare certificates
 sudo tee /etc/nginx/sites-available/nyyu-market > /dev/null <<EOF
 # HTTP API Upstream
 upstream nyyu_http_api {
@@ -377,16 +388,26 @@ upstream nyyu_http_api {
     keepalive 32;
 }
 
+# gRPC API Upstream
+upstream nyyu_grpc_api {
+    server localhost:50051;
+    keepalive 32;
+}
+
 # HTTP Server - Redirect to HTTPS
 server {
     listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
+
+    # FIXED: Use variable without escaping to prevent malformed Host header
     return 301 https://\$server_name\$request_uri;
 }
 
 # HTTPS Server
 server {
     listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name $DOMAIN;
 
     # Cloudflare SSL Certificate
@@ -398,28 +419,81 @@ server {
     ssl_ciphers HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
 
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    # Increase timeout for streaming
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 75s;
+
     # HTTP API
     location / {
         proxy_pass http://nyyu_http_api;
         proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Connection "";
-        proxy_connect_timeout 30s;
-        proxy_send_timeout 30s;
-        proxy_read_timeout 30s;
+        proxy_cache_bypass \$http_upgrade;
+    }
+
+    # Prometheus metrics endpoint
+    location /metrics {
+        proxy_pass http://nyyu_http_api/metrics;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+
+        # Optional: Restrict to specific IPs (uncomment if needed)
+        # allow 1.2.3.4;  # Your monitoring server IP
+        # deny all;
     }
 
     # Health check
     location /health {
         proxy_pass http://nyyu_http_api/health;
+        proxy_set_header Host \$host;
         access_log off;
+    }
+
+    # Real-time status endpoint
+    location /api/v1/realtime/status {
+        proxy_pass http://nyyu_http_api/api/v1/realtime/status;
+        proxy_set_header Host \$host;
+    }
+
+    # Symbols endpoint
+    location /api/v1/binance/candles/symbols {
+        proxy_pass http://nyyu_http_api/api/v1/binance/candles/symbols;
+        proxy_set_header Host \$host;
     }
 
     access_log /var/log/nginx/nyyu_https_access.log;
     error_log /var/log/nginx/nyyu_https_error.log;
+}
+
+# gRPC Server (if needed)
+server {
+    listen 50051 http2;
+    server_name $DOMAIN;
+
+    location / {
+        grpc_pass grpc://nyyu_grpc_api;
+        grpc_set_header Host \$host;
+        grpc_set_header X-Real-IP \$remote_addr;
+        error_page 502 = /error502grpc;
+    }
+
+    location = /error502grpc {
+        internal;
+        default_type application/grpc;
+        add_header grpc-status 14;
+        add_header content-length 0;
+        return 204;
+    }
 }
 EOF
 
@@ -498,13 +572,17 @@ upstream nyyu_http_api {
 # HTTP Server - Redirect to HTTPS
 server {
     listen 80;
+    listen [::]:80;
     server_name $DOMAIN;
-    return 301 https://\\\$server_name\\\$request_uri;
+
+    # FIXED: Use variable without escaping to prevent malformed Host header
+    return 301 https://\$server_name\$request_uri;
 }
 
 # HTTPS Server
 server {
     listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name $DOMAIN;
 
     # Let's Encrypt SSL Certificate
@@ -516,24 +594,50 @@ server {
     ssl_ciphers HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
 
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    # Increase timeout for streaming
+    proxy_read_timeout 300s;
+    proxy_connect_timeout 75s;
+
     # HTTP API
     location / {
         proxy_pass http://nyyu_http_api;
         proxy_http_version 1.1;
-        proxy_set_header Host \\\$host;
-        proxy_set_header X-Real-IP \\\$remote_addr;
-        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \\\$scheme;
-        proxy_set_header Connection "";
-        proxy_connect_timeout 30s;
-        proxy_send_timeout 30s;
-        proxy_read_timeout 30s;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+
+    # Prometheus metrics endpoint
+    location /metrics {
+        proxy_pass http://nyyu_http_api/metrics;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+
+        # Optional: Restrict to specific IPs (uncomment if needed)
+        # allow 1.2.3.4;  # Your monitoring server IP
+        # deny all;
     }
 
     # Health check
     location /health {
         proxy_pass http://nyyu_http_api/health;
+        proxy_set_header Host \$host;
         access_log off;
+    }
+
+    # Real-time status endpoint
+    location /api/v1/realtime/status {
+        proxy_pass http://nyyu_http_api/api/v1/realtime/status;
+        proxy_set_header Host \$host;
     }
 
     access_log /var/log/nginx/nyyu_https_access.log;

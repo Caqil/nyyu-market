@@ -276,3 +276,28 @@ func (r *CandleRepository) GetStats(ctx context.Context) (map[string]interface{}
 		"latest_candle":   latest,
 	}, nil
 }
+
+// GetAvailableSymbols retrieves all unique symbols from the candles table
+func (r *CandleRepository) GetAvailableSymbols(ctx context.Context) ([]string, error) {
+	query := `
+		SELECT DISTINCT symbol
+		FROM candles
+		ORDER BY symbol`
+
+	rows, err := r.clickhouse.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query symbols: %w", err)
+	}
+	defer rows.Close()
+
+	var symbols []string
+	for rows.Next() {
+		var symbol string
+		if err := rows.Scan(&symbol); err != nil {
+			return nil, fmt.Errorf("failed to scan symbol: %w", err)
+		}
+		symbols = append(symbols, symbol)
+	}
+
+	return symbols, nil
+}

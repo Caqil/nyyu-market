@@ -18,17 +18,18 @@ import (
 func (a *ExchangeAggregator) subscribeKraken(ex *Exchange) error {
 	a.activeStreamsMu.RLock()
 	streams := make([]string, 0, len(a.activeStreams))
-	for stream := range a.activeStreams {
-		streams = append(streams, stream)
+	for stream, refCount := range a.activeStreams {
+		// Only subscribe to streams with active users
+		if refCount > 0 {
+			streams = append(streams, stream)
+		}
 	}
 	a.activeStreamsMu.RUnlock()
 
-	// Fallback to default symbols if no subscriptions yet
+	// No fallback - must have symbols from API
 	if len(streams) == 0 {
-		streams = []string{
-			"btcusdt@1m", "ethusdt@1m", "bnbusdt@1m",
-			"solusdt@1m", "xrpusdt@1m",
-		}
+		a.logger.Warnf("No active streams to subscribe to on %s - waiting for subscriptions from API", ex.Name)
+		return nil
 	}
 
 	for _, streamKey := range streams {
@@ -134,10 +135,8 @@ func (a *ExchangeAggregator) processKrakenMessage(ex *Exchange, message []byte) 
 							UpdatedAt:    time.Now(),
 						}
 
-						a.updateAggregatedPrice(symbol, "Kraken", closePrc)
-
-						// Add to pending candles for aggregation (NOT direct write to DB)
-						a.addPendingCandle("Kraken", symbol, interval, candle)
+						// ⚡ Use real-time aggregator (zero-delay, lock-free)
+						a.realtimeAgg.ProcessCandleUpdate("Kraken", candle)
 					}
 				}
 			}
@@ -152,18 +151,21 @@ func (a *ExchangeAggregator) processKrakenMessage(ex *Exchange, message []byte) 
 func (a *ExchangeAggregator) subscribeCoinbase(ex *Exchange) error {
 	a.activeStreamsMu.RLock()
 	streams := make([]string, 0, len(a.activeStreams))
-	for stream := range a.activeStreams {
-		streams = append(streams, stream)
+	for stream, refCount := range a.activeStreams {
+		if refCount > 0 {
+			streams = append(streams, stream)
+		}
 	}
 	a.activeStreamsMu.RUnlock()
 
-	// Fallback to default symbols if no subscriptions yet
+	// No fallback - must have symbols from API
 	if len(streams) == 0 {
-		streams = []string{
-			"btcusdt@1m", "ethusdt@1m", "bnbusdt@1m",
-			"solusdt@1m", "xrpusdt@1m",
-		}
+		a.logger.Warnf("No active streams to subscribe to on %s - waiting for subscriptions from API", ex.Name)
+		return nil
 	}
+
+	// Group by interval to batch subscriptions
+	intervalGroups := make(map[string][]string)
 
 	for _, streamKey := range streams {
 		parts := strings.Split(streamKey, "@")
@@ -180,20 +182,41 @@ func (a *ExchangeAggregator) subscribeCoinbase(ex *Exchange) error {
 		}
 
 		coinbaseInterval := convertIntervalToCoinbase(interval)
+		intervalGroups[coinbaseInterval] = append(intervalGroups[coinbaseInterval], pair)
+	}
 
-		msg := map[string]interface{}{
-			"type":        "subscribe",
-			"product_ids": []string{pair},
-			"channels": []map[string]interface{}{
-				{
-					"name":     "candles",
-					"interval": coinbaseInterval,
+	// Coinbase rate limit: ~8 req/sec
+	// Batch up to 50 product_ids per request with delays
+	const maxProductsPerBatch = 50
+
+	for coinbaseInterval, products := range intervalGroups {
+		for i := 0; i < len(products); i += maxProductsPerBatch {
+			end := i + maxProductsPerBatch
+			if end > len(products) {
+				end = len(products)
+			}
+			batch := products[i:end]
+
+			msg := map[string]interface{}{
+				"type":        "subscribe",
+				"product_ids": batch,
+				"channels": []map[string]interface{}{
+					{
+						"name":     "candles",
+						"interval": coinbaseInterval,
+					},
 				},
-			},
-		}
+			}
 
-		if err := ex.conn.WriteJSON(msg); err != nil {
-			return err
+			if err := ex.conn.WriteJSON(msg); err != nil {
+				a.logger.WithError(err).Warnf("Failed to subscribe to Coinbase interval %s", coinbaseInterval)
+				return err
+			}
+
+			a.logger.Infof("Subscribed to %d products on Coinbase for interval %s", len(batch), coinbaseInterval)
+
+			// Delay to respect rate limit (8 req/sec = ~125ms between requests)
+			time.Sleep(150 * time.Millisecond)
 		}
 	}
 
@@ -265,10 +288,8 @@ func (a *ExchangeAggregator) processCoinbaseMessage(ex *Exchange, message []byte
 						UpdatedAt:    time.Now(),
 					}
 
-					a.updateAggregatedPrice(symbol, "Coinbase", closePrc)
-
-					// Add to pending candles for aggregation (NOT direct write to DB)
-					a.addPendingCandle("Coinbase", symbol, interval, candle)
+					// ⚡ Use real-time aggregator (zero-delay, lock-free)
+					a.realtimeAgg.ProcessCandleUpdate("Coinbase", candle)
 				}
 			}
 		}
@@ -282,17 +303,17 @@ func (a *ExchangeAggregator) processCoinbaseMessage(ex *Exchange, message []byte
 func (a *ExchangeAggregator) subscribeBybit(ex *Exchange) error {
 	a.activeStreamsMu.RLock()
 	streams := make([]string, 0, len(a.activeStreams))
-	for stream := range a.activeStreams {
-		streams = append(streams, stream)
+	for stream, refCount := range a.activeStreams {
+		if refCount > 0 {
+			streams = append(streams, stream)
+		}
 	}
 	a.activeStreamsMu.RUnlock()
 
-	// Fallback to default symbols if no subscriptions yet
+	// No fallback - must have symbols from API
 	if len(streams) == 0 {
-		streams = []string{
-			"btcusdt@1m", "ethusdt@1m", "bnbusdt@1m",
-			"solusdt@1m", "xrpusdt@1m",
-		}
+		a.logger.Warnf("No active streams to subscribe to on %s - waiting for subscriptions from API", ex.Name)
+		return nil
 	}
 
 	args := make([]string, 0)
@@ -308,12 +329,36 @@ func (a *ExchangeAggregator) subscribeBybit(ex *Exchange) error {
 		args = append(args, fmt.Sprintf("kline.%s.%s", bybitInterval, symbol))
 	}
 
-	msg := map[string]interface{}{
-		"op":   "subscribe",
-		"args": args,
+	// Bybit rate limit: 50 req/sec, max 10 args per subscription
+	// Batch up to 10 topics per request with delays
+	const maxTopicsPerBatch = 10
+
+	for i := 0; i < len(args); i += maxTopicsPerBatch {
+		end := i + maxTopicsPerBatch
+		if end > len(args) {
+			end = len(args)
+		}
+		batch := args[i:end]
+
+		msg := map[string]interface{}{
+			"op":   "subscribe",
+			"args": batch,
+		}
+
+		if err := ex.conn.WriteJSON(msg); err != nil {
+			a.logger.WithError(err).Warnf("Failed to subscribe to Bybit batch %d", i/maxTopicsPerBatch)
+			return err
+		}
+
+		a.logger.Infof("Subscribed to %d topics on Bybit (batch %d/%d)", len(batch), i/maxTopicsPerBatch+1, (len(args)+maxTopicsPerBatch-1)/maxTopicsPerBatch)
+
+		// Delay to respect rate limit (50 req/sec = 20ms, but we use 100ms for safety)
+		if end < len(args) {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
-	return ex.conn.WriteJSON(msg)
+	return nil
 }
 
 func (a *ExchangeAggregator) processBybitMessage(ex *Exchange, message []byte) {
@@ -388,10 +433,8 @@ func (a *ExchangeAggregator) processBybitMessage(ex *Exchange, message []byte) {
 					UpdatedAt:    time.Now(),
 				}
 
-				a.updateAggregatedPrice(symbol, "Bybit", closePrc)
-
-				// Add to pending candles for aggregation (NOT direct write to DB)
-				a.addPendingCandle("Bybit", symbol, interval, candle)
+				// ⚡ Use real-time aggregator (zero-delay, lock-free)
+				a.realtimeAgg.ProcessCandleUpdate("Bybit", candle)
 			}
 		}
 	}
@@ -404,17 +447,17 @@ func (a *ExchangeAggregator) processBybitMessage(ex *Exchange, message []byte) {
 func (a *ExchangeAggregator) subscribeOKX(ex *Exchange) error {
 	a.activeStreamsMu.RLock()
 	streams := make([]string, 0, len(a.activeStreams))
-	for stream := range a.activeStreams {
-		streams = append(streams, stream)
+	for stream, refCount := range a.activeStreams {
+		if refCount > 0 {
+			streams = append(streams, stream)
+		}
 	}
 	a.activeStreamsMu.RUnlock()
 
-	// Fallback to default symbols if no subscriptions yet
+	// No fallback - must have symbols from API
 	if len(streams) == 0 {
-		streams = []string{
-			"btcusdt@1m", "ethusdt@1m", "bnbusdt@1m",
-			"solusdt@1m", "xrpusdt@1m",
-		}
+		a.logger.Warnf("No active streams to subscribe to on %s - waiting for subscriptions from API", ex.Name)
+		return nil
 	}
 
 	args := make([]map[string]string, 0)
@@ -438,12 +481,36 @@ func (a *ExchangeAggregator) subscribeOKX(ex *Exchange) error {
 		})
 	}
 
-	msg := map[string]interface{}{
-		"op":   "subscribe",
-		"args": args,
+	// OKX rate limit: VERY STRICT - 3 req/sec, max 100 args per request
+	// Batch up to 20 args per request with longer delays
+	const maxArgsPerBatch = 20
+
+	for i := 0; i < len(args); i += maxArgsPerBatch {
+		end := i + maxArgsPerBatch
+		if end > len(args) {
+			end = len(args)
+		}
+		batch := args[i:end]
+
+		msg := map[string]interface{}{
+			"op":   "subscribe",
+			"args": batch,
+		}
+
+		if err := ex.conn.WriteJSON(msg); err != nil {
+			a.logger.WithError(err).Warnf("Failed to subscribe to OKX batch %d", i/maxArgsPerBatch)
+			return err
+		}
+
+		a.logger.Infof("Subscribed to %d channels on OKX (batch %d/%d)", len(batch), i/maxArgsPerBatch+1, (len(args)+maxArgsPerBatch-1)/maxArgsPerBatch)
+
+		// OKX is very strict - delay 350ms between requests (3 req/sec = 333ms)
+		if end < len(args) {
+			time.Sleep(350 * time.Millisecond)
+		}
 	}
 
-	return ex.conn.WriteJSON(msg)
+	return nil
 }
 
 func (a *ExchangeAggregator) processOKXMessage(ex *Exchange, message []byte) {
@@ -524,10 +591,8 @@ func (a *ExchangeAggregator) processOKXMessage(ex *Exchange, message []byte) {
 					UpdatedAt:    time.Now(),
 				}
 
-				a.updateAggregatedPrice(symbol, "OKX", closePrc)
-
-				// Add to pending candles for aggregation (NOT direct write to DB)
-				a.addPendingCandle("OKX", symbol, interval, candle)
+				// ⚡ Use real-time aggregator (zero-delay, lock-free)
+				a.realtimeAgg.ProcessCandleUpdate("OKX", candle)
 			}
 		}
 	}
@@ -540,18 +605,23 @@ func (a *ExchangeAggregator) processOKXMessage(ex *Exchange, message []byte) {
 func (a *ExchangeAggregator) subscribeGateIO(ex *Exchange) error {
 	a.activeStreamsMu.RLock()
 	streams := make([]string, 0, len(a.activeStreams))
-	for stream := range a.activeStreams {
-		streams = append(streams, stream)
+	for stream, refCount := range a.activeStreams {
+		if refCount > 0 {
+			streams = append(streams, stream)
+		}
 	}
 	a.activeStreamsMu.RUnlock()
 
-	// Fallback to default symbols if no subscriptions yet
+	// No fallback - must have symbols from API
 	if len(streams) == 0 {
-		streams = []string{
-			"btcusdt@1m", "ethusdt@1m", "bnbusdt@1m",
-			"solusdt@1m", "xrpusdt@1m",
-		}
+		a.logger.Warnf("No active streams to subscribe to on %s - waiting for subscriptions from API", ex.Name)
+		return nil
 	}
+
+	// Gate.io requires one subscription per symbol+interval
+	// Rate limit: 30 req/sec
+	// We'll batch with small delays to be safe
+	subscriptionCount := 0
 
 	for _, streamKey := range streams {
 		parts := strings.Split(streamKey, "@")
@@ -576,9 +646,20 @@ func (a *ExchangeAggregator) subscribeGateIO(ex *Exchange) error {
 		}
 
 		if err := ex.conn.WriteJSON(msg); err != nil {
+			a.logger.WithError(err).Warnf("Failed to subscribe to Gate.io for %s %s", symbol, interval)
 			return err
 		}
+
+		subscriptionCount++
+
+		// Delay every 20 subscriptions to respect rate limit (30 req/sec = ~33ms)
+		// We use 50ms for safety
+		if subscriptionCount%20 == 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
+
+	a.logger.Infof("Subscribed to %d streams on Gate.io", subscriptionCount)
 
 	return nil
 }
@@ -639,10 +720,8 @@ func (a *ExchangeAggregator) processGateIOMessage(ex *Exchange, message []byte) 
 					UpdatedAt:    time.Now(),
 				}
 
-				a.updateAggregatedPrice(symbol, "Gate.io", closePrc)
-
-				// Add to pending candles for aggregation (NOT direct write to DB)
-				a.addPendingCandle("Gate.io", symbol, interval, candle)
+				// ⚡ Use real-time aggregator (zero-delay, lock-free)
+				a.realtimeAgg.ProcessCandleUpdate("Gate.io", candle)
 			}
 		}
 	}
