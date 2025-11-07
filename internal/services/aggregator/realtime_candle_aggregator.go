@@ -28,6 +28,13 @@ type CandleServiceInterface interface {
 // IntervalAggregatorInterface for building higher timeframes
 type IntervalAggregatorInterface interface {
 	Process1mCandle(candle *models.Candle)
+	GetLastCompletedCandle(symbol, interval string) *models.Candle
+	GetLatestCandle(symbol, interval string) *models.Candle
+}
+
+// RepositoryInterface for querying historical candles
+type RepositoryInterface interface {
+	GetCandles(ctx context.Context, symbol, interval, exchange, contractType string, startTime, endTime time.Time, limit int) ([]models.Candle, error)
 }
 
 // RealtimeCandleAggregator is a lock-free, zero-delay candle aggregation system
@@ -40,6 +47,7 @@ type IntervalAggregatorInterface interface {
 type RealtimeCandleAggregator struct {
 	pubsub *pubsub.Publisher
 	logger *logrus.Logger
+	repo   RepositoryInterface // ⚡ NEW: For querying previous candles from database
 
 	// ⚡ LOCK-FREE: Live candles being built in real-time
 	// Key: "symbol:interval:timestamp" -> *LiveCandle
@@ -119,10 +127,11 @@ type AggregatedPrice struct {
 }
 
 // NewRealtimeCandleAggregator creates a new real-time aggregator
-func NewRealtimeCandleAggregator(pubsub *pubsub.Publisher, logger *logrus.Logger, candleBatchChan chan *models.Candle) *RealtimeCandleAggregator {
+func NewRealtimeCandleAggregator(pubsub *pubsub.Publisher, logger *logrus.Logger, candleBatchChan chan *models.Candle, repo RepositoryInterface) *RealtimeCandleAggregator {
 	return &RealtimeCandleAggregator{
 		pubsub:          pubsub,
 		logger:          logger,
+		repo:            repo,
 		candleBatchChan: candleBatchChan,
 		lastStatsTime:   time.Now(),
 	}
@@ -409,6 +418,7 @@ func (a *RealtimeCandleAggregator) handleClosedCandle(live *LiveCandle, aggregat
 
 // GetLatestCandle retrieves the latest aggregated candle for a symbol+interval
 // ⚡ O(1) lookup, no locks
+// ⚡ FIX: Falls back to database query if not found in memory
 func (a *RealtimeCandleAggregator) GetLatestCandle(symbol, interval string) *models.Candle {
 	// First check live candles (most recent)
 	var latestTimestamp int64
@@ -434,10 +444,34 @@ func (a *RealtimeCandleAggregator) GetLatestCandle(symbol, interval string) *mod
 		return latestCandle
 	}
 
-	// Fallback to latest closed candle
+	// Fallback to latest closed candle in memory
 	latestKey := fmt.Sprintf("%s:%s", symbol, interval)
 	if candleInterface, ok := a.latestCandles.Load(latestKey); ok {
 		return candleInterface.(*models.Candle)
+	}
+
+	// ⚡ FIX: If not in memory, query database for the most recent candle
+	// This handles cases where system just started and memory cache is empty
+	if a.repo != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		now := time.Now()
+		startTime := now.Add(-30 * 24 * time.Hour) // Look back 30 days
+
+		candles, err := a.repo.GetCandles(ctx, symbol, interval, "", "spot", startTime, now, 1)
+		if err != nil {
+			a.logger.WithError(err).Debugf("Failed to query last candle for %s %s", symbol, interval)
+			return nil
+		}
+
+		if len(candles) > 0 {
+			lastCandle := &candles[0]
+			// Store in cache for future access
+			a.latestCandles.Store(latestKey, lastCandle)
+			a.logger.Debugf("✅ Loaded last candle from database: %s %s at %v", symbol, interval, lastCandle.OpenTime)
+			return lastCandle
+		}
 	}
 
 	return nil

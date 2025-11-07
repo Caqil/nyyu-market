@@ -116,6 +116,9 @@ type ExchangeAggregator struct {
 	// ⚡ NEW: Zero-delay real-time aggregator (lock-free, streaming)
 	realtimeAgg *RealtimeCandleAggregator
 
+	// ⚡ FIX: Reference to interval aggregator for higher timeframe candles
+	intervalAgg IntervalAggregatorInterface
+
 	// ⚡ DEPRECATED: Old pending candles system (keep for compatibility during migration)
 	// Map structure: symbol -> interval -> openTime -> exchange -> candle
 	pendingCandles   map[string]map[string]map[int64]map[string]*models.Candle
@@ -143,6 +146,7 @@ func NewExchangeAggregator(
 	pubsub *pubsub.Publisher,
 	logger *logrus.Logger,
 	proxyService ProxyServiceInterface,
+	candleRepo RepositoryInterface,
 ) *ExchangeAggregator {
 	now := time.Now()
 	exchanges := []*Exchange{
@@ -168,8 +172,8 @@ func NewExchangeAggregator(
 	// Create candle batch channel
 	candleBatchChan := make(chan *models.Candle, 10000)
 
-	// ⚡ NEW: Initialize zero-delay real-time aggregator
-	realtimeAgg := NewRealtimeCandleAggregator(pubsub, logger, candleBatchChan)
+	// ⚡ NEW: Initialize zero-delay real-time aggregator with repository access
+	realtimeAgg := NewRealtimeCandleAggregator(pubsub, logger, candleBatchChan, candleRepo)
 
 	// ⚡ Connect candle service to realtime aggregator for 24h stats
 	realtimeAgg.SetCandleService(candleSvc)
@@ -222,6 +226,9 @@ func NewExchangeAggregator(
 
 // SetIntervalAggregator connects the interval aggregator to receive real-time 1m candles
 func (a *ExchangeAggregator) SetIntervalAggregator(intervalAgg IntervalAggregatorInterface) {
+	// ⚡ FIX: Store reference for querying higher timeframe candles
+	a.intervalAgg = intervalAgg
+
 	if a.realtimeAgg != nil {
 		a.realtimeAgg.SetIntervalAggregator(intervalAgg)
 		a.logger.Info("✅ Interval aggregator connected to real-time 1m candle stream")
@@ -838,11 +845,16 @@ func (a *ExchangeAggregator) processBinanceMessage(ex *Exchange, message []byte)
 	}
 
 	// Convert to our candle model
+	// CRITICAL FIX: Proper millisecond timestamp conversion for ClickHouse DateTime64(3)
+	// Binance sends timestamps in milliseconds, must convert correctly to avoid date corruption
+	openTimeMs := msg.Kline.StartTime
+	closeTimeMs := msg.Kline.CloseTime
+
 	candle := &models.Candle{
 		Symbol:       msg.Symbol,
 		Interval:     msg.Kline.Interval,
-		OpenTime:     time.UnixMilli(msg.Kline.StartTime),
-		CloseTime:    time.UnixMilli(msg.Kline.CloseTime),
+		OpenTime:     time.Unix(openTimeMs/1000, (openTimeMs%1000)*1_000_000).UTC(),
+		CloseTime:    time.Unix(closeTimeMs/1000, (closeTimeMs%1000)*1_000_000).UTC(),
 		IsClosed:     msg.Kline.IsKlineClosed,
 		Source:       "binance",
 		ContractType: "spot",
@@ -991,9 +1003,19 @@ func (a *ExchangeAggregator) aggregateCandles(symbol, interval string, candles m
 
 // GetLatestInMemoryCandle gets the most recent candle from in-memory pending candles
 func (a *ExchangeAggregator) GetLatestInMemoryCandle(symbol, interval string) *models.Candle {
-	// ⚡ NEW: Use zero-delay real-time aggregator first (lock-free O(1))
-	if candle := a.realtimeAgg.GetLatestCandle(symbol, interval); candle != nil {
-		return candle
+	// ⚡ For 1m candles: Use zero-delay real-time aggregator (lock-free O(1))
+	if interval == "1m" {
+		if candle := a.realtimeAgg.GetLatestCandle(symbol, interval); candle != nil {
+			return candle
+		}
+	} else {
+		// ⚡ FIX: For higher timeframes (3m, 5m, 15m, etc.): Query interval aggregator
+		// This returns both building (in-progress) and completed candles
+		if a.intervalAgg != nil {
+			if candle := a.intervalAgg.GetLatestCandle(symbol, interval); candle != nil {
+				return candle
+			}
+		}
 	}
 
 	// ⚡ FALLBACK: Use old system for compatibility during migration

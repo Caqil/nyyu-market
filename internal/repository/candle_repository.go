@@ -26,12 +26,14 @@ func NewCandleRepository(clickhouse driver.Conn, logger *logrus.Logger) *CandleR
 
 // GetCandles retrieves candles from ClickHouse
 func (r *CandleRepository) GetCandles(ctx context.Context, symbol, interval, source, contractType string, startTime, endTime time.Time, limit int) ([]models.Candle, error) {
+	// ⚡ FIX: Cast Decimal64 to String in SQL for proper scanning
+	// Note: Import script now prevents duplicates, so we don't need FINAL or complex deduplication
 	query := `
 		SELECT
 			symbol, interval, open_time, close_time,
-			open, high, low, close,
-			volume, quote_volume, trade_count,
-			taker_buy_base_volume, taker_buy_quote_volume,
+			toString(open) as open, toString(high) as high, toString(low) as low, toString(close) as close,
+			toString(volume) as volume, toString(quote_volume) as quote_volume, trade_count,
+			toString(taker_buy_base_volume) as taker_buy_base_volume, toString(taker_buy_quote_volume) as taker_buy_quote_volume,
 			source, is_closed, contract_type,
 			created_at, updated_at
 		FROM candles
@@ -73,8 +75,10 @@ func (r *CandleRepository) GetCandles(ctx context.Context, symbol, interval, sou
 		var isClosed uint8
 		var tradeCount uint32
 
-		var open, high, low, close, volume, quoteVolume float64
-		var takerBuyBase, takerBuyQuote float64
+		// ⚡ FIX: Scan Decimal64 as strings and convert to decimal.Decimal
+		// ClickHouse Decimal64 values need to be scanned as strings
+		var open, high, low, close, volume, quoteVolume string
+		var takerBuyBase, takerBuyQuote string
 
 		err := rows.Scan(
 			&candle.Symbol, &candle.Interval, &candle.OpenTime, &candle.CloseTime,
@@ -88,14 +92,15 @@ func (r *CandleRepository) GetCandles(ctx context.Context, symbol, interval, sou
 			return nil, fmt.Errorf("failed to scan candle: %w", err)
 		}
 
-		candle.Open = decimal.NewFromFloat(open)
-		candle.High = decimal.NewFromFloat(high)
-		candle.Low = decimal.NewFromFloat(low)
-		candle.Close = decimal.NewFromFloat(close)
-		candle.Volume = decimal.NewFromFloat(volume)
-		candle.QuoteVolume = decimal.NewFromFloat(quoteVolume)
-		candle.TakerBuyBaseVolume = decimal.NewFromFloat(takerBuyBase)
-		candle.TakerBuyQuoteVolume = decimal.NewFromFloat(takerBuyQuote)
+		// Convert string decimals to decimal.Decimal
+		candle.Open, _ = decimal.NewFromString(open)
+		candle.High, _ = decimal.NewFromString(high)
+		candle.Low, _ = decimal.NewFromString(low)
+		candle.Close, _ = decimal.NewFromString(close)
+		candle.Volume, _ = decimal.NewFromString(volume)
+		candle.QuoteVolume, _ = decimal.NewFromString(quoteVolume)
+		candle.TakerBuyBaseVolume, _ = decimal.NewFromString(takerBuyBase)
+		candle.TakerBuyQuoteVolume, _ = decimal.NewFromString(takerBuyQuote)
 		candle.IsClosed = isClosed == 1
 		candle.TradeCount = int(tradeCount)
 
@@ -112,11 +117,14 @@ func (r *CandleRepository) GetCandles(ctx context.Context, symbol, interval, sou
 
 // GetLatestCandle retrieves the latest candle
 func (r *CandleRepository) GetLatestCandle(ctx context.Context, symbol, interval, source, contractType string) (*models.Candle, error) {
+	// ⚡ FIX: Cast Decimal64 to String in SQL for proper scanning
+	// Note: Import script now prevents duplicates, so we don't need FINAL or complex deduplication
 	query := `
 		SELECT
 			symbol, interval, open_time, close_time,
-			open, high, low, close,
-			volume, quote_volume, trade_count,
+			toString(open) as open, toString(high) as high, toString(low) as low, toString(close) as close,
+			toString(volume) as volume, toString(quote_volume) as quote_volume, trade_count,
+			toString(taker_buy_base_volume) as taker_buy_base_volume, toString(taker_buy_quote_volume) as taker_buy_quote_volume,
 			source, is_closed, contract_type,
 			created_at, updated_at
 		FROM candles
@@ -136,12 +144,15 @@ func (r *CandleRepository) GetLatestCandle(ctx context.Context, symbol, interval
 	var candle models.Candle
 	var isClosed uint8
 	var tradeCount uint32
-	var open, high, low, close, volume, quoteVolume float64
+	// ⚡ FIX: Scan Decimal64 as strings
+	var open, high, low, close, volume, quoteVolume string
+	var takerBuyBase, takerBuyQuote string
 
 	err := row.Scan(
 		&candle.Symbol, &candle.Interval, &candle.OpenTime, &candle.CloseTime,
 		&open, &high, &low, &close,
 		&volume, &quoteVolume, &tradeCount,
+		&takerBuyBase, &takerBuyQuote,
 		&candle.Source, &isClosed, &candle.ContractType,
 		&candle.CreatedAt, &candle.UpdatedAt,
 	)
@@ -149,12 +160,15 @@ func (r *CandleRepository) GetLatestCandle(ctx context.Context, symbol, interval
 		return nil, err
 	}
 
-	candle.Open = decimal.NewFromFloat(open)
-	candle.High = decimal.NewFromFloat(high)
-	candle.Low = decimal.NewFromFloat(low)
-	candle.Close = decimal.NewFromFloat(close)
-	candle.Volume = decimal.NewFromFloat(volume)
-	candle.QuoteVolume = decimal.NewFromFloat(quoteVolume)
+	// Convert string decimals to decimal.Decimal
+	candle.Open, _ = decimal.NewFromString(open)
+	candle.High, _ = decimal.NewFromString(high)
+	candle.Low, _ = decimal.NewFromString(low)
+	candle.Close, _ = decimal.NewFromString(close)
+	candle.Volume, _ = decimal.NewFromString(volume)
+	candle.QuoteVolume, _ = decimal.NewFromString(quoteVolume)
+	candle.TakerBuyBaseVolume, _ = decimal.NewFromString(takerBuyBase)
+	candle.TakerBuyQuoteVolume, _ = decimal.NewFromString(takerBuyQuote)
 	candle.IsClosed = isClosed == 1
 	candle.TradeCount = int(tradeCount)
 
@@ -173,27 +187,28 @@ func (r *CandleRepository) CreateCandle(ctx context.Context, candle *models.Cand
 			created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-	open, _ := candle.Open.Float64()
-	high, _ := candle.High.Float64()
-	low, _ := candle.Low.Float64()
-	close, _ := candle.Close.Float64()
-	volume, _ := candle.Volume.Float64()
-	quoteVolume, _ := candle.QuoteVolume.Float64()
-	takerBuyBase, _ := candle.TakerBuyBaseVolume.Float64()
-	takerBuyQuote, _ := candle.TakerBuyQuoteVolume.Float64()
-
+	// ⚡ OPTIMIZED: Use decimal.Decimal directly with Decimal64(8) columns
+	// ClickHouse Go driver automatically converts decimal.Decimal to Decimal64
+	// This preserves precision better than Float64 conversion
 	isClosed := uint8(0)
 	if candle.IsClosed {
 		isClosed = 1
 	}
 
+	// CRITICAL FIX: Convert time.Time to int64 milliseconds for DateTime64(3) columns
+	// The ClickHouse Go driver has issues with time.Time -> DateTime64(3) conversion
+	openTimeMs := candle.OpenTime.UnixMilli()
+	closeTimeMs := candle.CloseTime.UnixMilli()
+	createdAtMs := candle.CreatedAt.UnixMilli()
+	updatedAtMs := candle.UpdatedAt.UnixMilli()
+
 	err := r.clickhouse.Exec(ctx, query,
-		candle.Symbol, candle.Interval, candle.OpenTime, candle.CloseTime,
-		open, high, low, close,
-		volume, quoteVolume, candle.TradeCount,
-		takerBuyBase, takerBuyQuote,
+		candle.Symbol, candle.Interval, openTimeMs, closeTimeMs,
+		candle.Open, candle.High, candle.Low, candle.Close,
+		candle.Volume, candle.QuoteVolume, candle.TradeCount,
+		candle.TakerBuyBaseVolume, candle.TakerBuyQuoteVolume,
 		candle.Source, isClosed, candle.ContractType,
-		candle.CreatedAt, candle.UpdatedAt,
+		createdAtMs, updatedAtMs,
 	)
 
 	return err
@@ -203,6 +218,11 @@ func (r *CandleRepository) CreateCandle(ctx context.Context, candle *models.Cand
 func (r *CandleRepository) BatchCreateCandles(ctx context.Context, candles []*models.Candle) error {
 	if len(candles) == 0 {
 		return nil
+	}
+
+	// Set max_partitions_per_insert_block to handle large batches with many partitions
+	if err := r.clickhouse.Exec(ctx, "SET max_partitions_per_insert_block = 10000"); err != nil {
+		return fmt.Errorf("failed to set max_partitions_per_insert_block: %w", err)
 	}
 
 	batch, err := r.clickhouse.PrepareBatch(ctx, `
@@ -218,28 +238,29 @@ func (r *CandleRepository) BatchCreateCandles(ctx context.Context, candles []*mo
 		return fmt.Errorf("failed to prepare batch: %w", err)
 	}
 
+	// ⚡ OPTIMIZED: Batch insert with decimal.Decimal directly
+	// Better precision with Decimal64(8) columns in ClickHouse
 	for _, candle := range candles {
-		open, _ := candle.Open.Float64()
-		high, _ := candle.High.Float64()
-		low, _ := candle.Low.Float64()
-		close, _ := candle.Close.Float64()
-		volume, _ := candle.Volume.Float64()
-		quoteVolume, _ := candle.QuoteVolume.Float64()
-		takerBuyBase, _ := candle.TakerBuyBaseVolume.Float64()
-		takerBuyQuote, _ := candle.TakerBuyQuoteVolume.Float64()
-
 		isClosed := uint8(0)
 		if candle.IsClosed {
 			isClosed = 1
 		}
 
+		// CRITICAL FIX: Convert time.Time to int64 milliseconds for DateTime64(3) columns
+		// The ClickHouse Go driver has issues with time.Time -> DateTime64(3) conversion
+		// This ensures accurate timestamp storage
+		openTimeMs := candle.OpenTime.UnixMilli()
+		closeTimeMs := candle.CloseTime.UnixMilli()
+		createdAtMs := candle.CreatedAt.UnixMilli()
+		updatedAtMs := candle.UpdatedAt.UnixMilli()
+
 		err := batch.Append(
-			candle.Symbol, candle.Interval, candle.OpenTime, candle.CloseTime,
-			open, high, low, close,
-			volume, quoteVolume, candle.TradeCount,
-			takerBuyBase, takerBuyQuote,
+			candle.Symbol, candle.Interval, openTimeMs, closeTimeMs,
+			candle.Open, candle.High, candle.Low, candle.Close,
+			candle.Volume, candle.QuoteVolume, candle.TradeCount,
+			candle.TakerBuyBaseVolume, candle.TakerBuyQuoteVolume,
 			candle.Source, isClosed, candle.ContractType,
-			candle.CreatedAt, candle.UpdatedAt,
+			createdAtMs, updatedAtMs,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to append to batch: %w", err)

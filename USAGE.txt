@@ -1,0 +1,45 @@
+================================================================================
+  BINANCE HISTORICAL DATA IMPORT - USAGE GUIDE
+================================================================================
+
+COMMAND:
+  ./import-binance-to-azure.sh
+
+EXAMPLE INPUT FOR DATE RANGE (Option 2):
+
+  Symbol: BTCUSDT
+  Interval: 1h,4h,1d    (or "all" for 1h,4h,1d,1w)
+  Start: 2024 01
+  End: 2024 10
+
+WHAT IT DOES:
+  ✅ Downloads from Binance
+  ✅ Converts to your format (source='aggregated')  
+  ✅ Imports to Azure ClickHouse
+  ✅ Supports multiple intervals at once!
+
+INTERVAL OPTIONS:
+  Single:   1h
+  Multiple: 1h,4h,1d
+  All:      all  (imports 1h,4h,1d,1w)
+
+POPULAR SYMBOLS:
+  BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT
+
+TIPS:
+  • Use 2024 dates (not 2025 - doesn't exist yet)
+  • Start with "1d" interval (fastest)
+  • Use "all" for common intervals
+  • Don't leave fields empty!
+
+VERIFY DATA:
+  ssh -i ~/Downloads/Azure-NYYU.pem azureuser@market.nyyu.io
+  cd /opt/nyyu-market
+  docker compose exec clickhouse clickhouse-client
+  
+  SELECT symbol, interval, count() 
+  FROM trade.candles 
+  WHERE source='aggregated' 
+  GROUP BY symbol, interval;
+
+================================================================================

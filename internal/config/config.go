@@ -15,6 +15,7 @@ type Config struct {
 	Redis      RedisConfig
 	Cache      CacheConfig
 	Service    ServiceConfig
+	Symbol     SymbolConfig
 	Exchange   ExchangeConfig
 	MarkPrice  MarkPriceConfig
 	Logging    LoggingConfig
@@ -53,6 +54,19 @@ type ServiceConfig struct {
 	DefaultCandlesLimit int
 	BatchWriteSize      int
 	BatchWriteInterval  time.Duration
+}
+
+type SymbolConfig struct {
+	// Strategy for subscribing to symbols: "all", "popular", "top_N"
+	SubscriptionStrategy string
+	// Number of symbols to subscribe (for "top_N" strategy)
+	MaxSymbols int
+	// Minimum 24h volume in USDT to subscribe (0 = no filter)
+	MinVolume float64
+	// Refresh interval for symbol list
+	RefreshInterval time.Duration
+	// Auto-subscribe to new symbols
+	AutoSubscribe bool
 }
 
 type ExchangeConfig struct {
@@ -109,6 +123,13 @@ func Load() (*Config, error) {
 			DefaultCandlesLimit: getEnvInt("DEFAULT_CANDLES_LIMIT", 100),
 			BatchWriteSize:      getEnvInt("BATCH_WRITE_SIZE", 100),
 			BatchWriteInterval:  parseDuration(getEnv("BATCH_WRITE_INTERVAL", "1s"), 1*time.Second),
+		},
+		Symbol: SymbolConfig{
+			SubscriptionStrategy: getEnv("SYMBOL_SUBSCRIPTION_STRATEGY", "top_N"),
+			MaxSymbols:           getEnvInt("SYMBOL_MAX_SYMBOLS", 50),
+			MinVolume:            getEnvFloat("SYMBOL_MIN_VOLUME", 0),
+			RefreshInterval:      parseDuration(getEnv("SYMBOL_REFRESH_INTERVAL", "1h"), 1*time.Hour),
+			AutoSubscribe:        getEnvBool("SYMBOL_AUTO_SUBSCRIBE", true),
 		},
 		Exchange: ExchangeConfig{
 			EnableBinance:  getEnvBool("ENABLE_BINANCE", true),
@@ -171,6 +192,15 @@ func getEnvBool(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		if boolVal, err := strconv.ParseBool(value); err == nil {
 			return boolVal
+		}
+	}
+	return defaultValue
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatVal
 		}
 	}
 	return defaultValue

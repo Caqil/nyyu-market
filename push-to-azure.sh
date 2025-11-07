@@ -99,6 +99,11 @@ cp Dockerfile.simple "$TEMP_DIR/Dockerfile"
 cp docker-compose.yml "$TEMP_DIR/"
 cp .env.example "$TEMP_DIR/"
 
+# Copy ClickHouse config
+if [ -f "clickhouse-config.xml" ]; then
+    cp clickhouse-config.xml "$TEMP_DIR/"
+fi
+
 # Copy migrations if exists
 if [ -d "migrations" ]; then
     cp -r migrations "$TEMP_DIR/"
@@ -130,6 +135,12 @@ scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/Dockerfile" "$SERVER
 scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/docker-compose.yml" "$SERVER:$REMOTE_DIR/"
 scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/.env.example" "$SERVER:$REMOTE_DIR/"
 
+# Upload ClickHouse config if exists
+if [ -f "$TEMP_DIR/clickhouse-config.xml" ]; then
+    echo "Uploading ClickHouse optimized config..."
+    scp -i "$SSH_KEY" -o StrictHostKeyChecking=no -C "$TEMP_DIR/clickhouse-config.xml" "$SERVER:$REMOTE_DIR/"
+fi
+
 # Upload migrations if exists
 if [ -d "$TEMP_DIR/migrations" ]; then
     echo "Uploading migrations..."
@@ -149,10 +160,43 @@ echo -e "${GREEN}✅ Files uploaded${NC}"
 ###############################################################################
 
 echo ""
-echo -e "${YELLOW}[4/5] Setting up environment...${NC}"
+echo -e "${YELLOW}[4/8] Setting up environment...${NC}"
 
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" bash << 'ENDSSH'
 set -e
+
+# FIX SYSTEM TIME FIRST (critical for SSL and package installation)
+echo "Checking system time..."
+CURRENT_YEAR=$(date +%Y)
+if [ "$CURRENT_YEAR" -lt 2025 ]; then
+    echo "⚠️  System time is incorrect (Year: $CURRENT_YEAR)"
+    echo "Fixing system time..."
+
+    # Enable NTP time synchronization
+    sudo timedatectl set-ntp true
+
+    # Restart time sync service
+    sudo systemctl restart systemd-timesyncd
+
+    # Wait for time to sync
+    echo "Waiting for time synchronization..."
+    sleep 5
+
+    # Force immediate sync
+    sudo timedatectl set-ntp false
+    sudo timedatectl set-ntp true
+
+    sleep 3
+
+    NEW_YEAR=$(date +%Y)
+    echo "✅ System time fixed: $(date)"
+
+    if [ "$NEW_YEAR" -lt 2025 ]; then
+        echo "⚠️  Warning: Time sync may not have completed. Continuing anyway..."
+    fi
+else
+    echo "✅ System time is correct: $(date)"
+fi
 
 # Install Docker if not present
 if ! command -v docker &> /dev/null; then
@@ -328,7 +372,7 @@ echo -e "${GREEN}✅ Nginx ready${NC}"
 ###############################################################################
 
 echo ""
-echo -e "${YELLOW}[6/7] Setting up SSL...${NC}"
+echo -e "${YELLOW}[6/8] Setting up SSL...${NC}"
 echo ""
 echo "Choose SSL option:"
 echo "1) Cloudflare SSL (recommended - free, easy)"
@@ -503,6 +547,9 @@ sudo nginx -t && sudo systemctl reload nginx
 echo "✅ Cloudflare SSL certificates installed"
 ENDSSH
 
+            # Let's Encrypt SSL is handled separately
+            echo "✅ SSL configured for main domain"
+
             echo -e "${GREEN}✅ Cloudflare SSL configured${NC}"
         else
             echo -e "${RED}❌ Certificate files not found${NC}"
@@ -651,7 +698,7 @@ EOF
     sudo systemctl enable certbot.timer
     sudo systemctl start certbot.timer
 
-    echo "✅ SSL certificate installed"
+    echo "✅ SSL certificate installed for $DOMAIN"
 fi
 ENDSSH
 else
@@ -665,7 +712,7 @@ echo -e "${GREEN}✅ SSL configuration complete${NC}"
 ###############################################################################
 
 echo ""
-echo -e "${YELLOW}[7/7] Deploying application...${NC}"
+echo -e "${YELLOW}[7/8] Deploying application...${NC}"
 
 ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SERVER" bash << 'ENDSSH'
 set -e

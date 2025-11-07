@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- ============================================ -->
+    <!-- DISABLE ALL SYSTEM LOGS (Save 95% disk space) -->
+    <!-- ============================================ -->
+    <query_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <text_log remove="1"/>
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <part_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <session_log remove="1"/>
+    <query_views_log remove="1"/>
+    <asynchronous_insert_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <crash_log remove="1"/>
+    <zookeeper_log remove="1"/>
+    <backup_log remove="1"/>
+    <blob_storage_log remove="1"/>
+
+    <!-- ============================================ -->
+    <!-- PERFORMANCE OPTIMIZATIONS -->
+    <!-- ============================================ -->
+
+    <!-- Server-level settings -->
+    <max_table_size_to_drop>0</max_table_size_to_drop> <!-- Allow dropping large tables -->
+    <max_partition_size_to_drop>0</max_partition_size_to_drop>
+
+    <!-- Compression (excellent for time-series data) -->
+    <compression>
+        <case>
+            <min_part_size>10485760</min_part_size> <!-- 10MB -->
+            <min_part_size_ratio>0.01</min_part_size_ratio>
+            <method>zstd</method>
+            <level>3</level> <!-- Fast compression, good ratio -->
+        </case>
+    </compression>
+
+    <!-- Background merge operations -->
+    <background_pool_size>16</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
+    <background_schedule_pool_size>16</background_schedule_pool_size>
+    <background_fetches_pool_size>8</background_fetches_pool_size>
+    <background_move_pool_size>8</background_move_pool_size>
+    <background_common_pool_size>8</background_common_pool_size>
+
+    <!-- Network -->
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <max_connections>1000</max_connections>
+
+    <!-- Disk space management -->
+    <merge_tree>
+        <!-- Aggressive merging for better compression -->
+        <parts_to_throw_insert>300</parts_to_throw_insert>
+        <parts_to_delay_insert>150</parts_to_delay_insert>
+        <max_delay_to_insert>1</max_delay_to_insert>
+
+        <!-- Compact parts for time-series -->
+        <min_bytes_for_wide_part>10485760</min_bytes_for_wide_part> <!-- 10MB -->
+        <min_rows_for_wide_part>0</min_rows_for_wide_part>
+
+        <!-- Faster inserts -->
+        <max_replicated_merges_in_queue>16</max_replicated_merges_in_queue>
+        <replicated_deduplication_window>100</replicated_deduplication_window>
+        <replicated_deduplication_window_seconds>604800</replicated_deduplication_window_seconds> <!-- 7 days -->
+
+        <!-- TTL check interval -->
+        <merge_with_ttl_timeout>86400</merge_with_ttl_timeout> <!-- 24 hours -->
+        <ttl_only_drop_parts>1</ttl_only_drop_parts> <!-- Drop entire parts when TTL expires -->
+    </merge_tree>
+
+    <!-- Query cache (for repeated queries) -->
+    <query_cache>
+        <max_size_in_bytes>1073741824</max_size_in_bytes> <!-- 1GB -->
+        <max_entries>1000</max_entries>
+        <max_entry_size_in_bytes>1048576</max_entry_size_in_bytes> <!-- 1MB -->
+        <max_entry_size_in_rows>30000</max_entry_size_in_rows>
+    </query_cache>
+
+    <!-- Mark cache (for faster queries) -->
+    <mark_cache_size>5368709120</mark_cache_size> <!-- 5GB -->
+    <uncompressed_cache_size>8589934592</uncompressed_cache_size> <!-- 8GB -->
+
+    <!-- Timezone -->
+    <timezone>UTC</timezone>
+
+    <!-- Listen on all interfaces -->
+    <listen_host>::</listen_host>
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>

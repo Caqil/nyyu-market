@@ -1,0 +1,24 @@
+# Symbols that need historical data import (from Sept 2025)
+# These symbols only have data from Nov 5, 2025
+
+RENDERUSDT
+PYTHUSDT
+WIFUSDT
+CAKEUSDT
+JTOUSDT
+BONKUSDT
+RAYUSDT
+JUPUSDT
+GMTUSDT
+ORCAUSDT
+XVSUSDT
+MOBILEUSDT
+PYUSDUSDT
+
+# To import, run:
+# ./import-binance-to-azure.sh
+# Select Option 3 (batch import)
+# Paste the above symbols (comma-separated)
+# Interval: 1m
+# Start: 2025-09
+# End: 2025-11

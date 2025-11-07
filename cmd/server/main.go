@@ -69,9 +69,9 @@ func main() {
 		Settings: clickhouse.Settings{
 			"max_execution_time": 60,
 		},
-		DialTimeout:      10 * time.Second,
-		MaxOpenConns:     10,
-		MaxIdleConns:     5,
+		DialTimeout:      30 * time.Second,
+		MaxOpenConns:     50,  // Increased for parallel aggregation workload
+		MaxIdleConns:     25,  // Keep more idle connections ready
 		ConnMaxLifetime:  time.Hour,
 		ConnOpenStrategy: clickhouse.ConnOpenInOrder,
 	})
@@ -86,12 +86,10 @@ func main() {
 	}
 	logger.Info("ClickHouse connected successfully")
 
-	// Run migrations
-	logger.Info("Running ClickHouse migrations...")
-	if err := runMigrations(clickhouseConn, logger); err != nil {
-		logger.Fatal("Failed to run migrations: ", err)
-	}
-	logger.Info("Migrations completed successfully")
+	// ⚡ OPTIMIZED: Migrations now run via docker-entrypoint-initdb.d
+	// The migration file is mounted in docker-compose.yml and runs automatically
+	// No need for inline migrations - this allows using the optimized schema
+	logger.Info("✅ Database ready (migrations handled by docker-entrypoint-initdb.d)")
 
 	// Initialize Redis
 	logger.Info("Connecting to Redis...")
@@ -152,7 +150,7 @@ func main() {
 	candleSvc := candleService.NewService(candleRepo, candleCache, publisher, cfg, logger)
 
 	// Initialize exchange aggregator (with proxy support)
-	exchangeAgg := aggregator.NewExchangeAggregator(cfg, candleSvc, publisher, logger, proxySvc)
+	exchangeAgg := aggregator.NewExchangeAggregator(cfg, candleSvc, publisher, logger, proxySvc, candleRepo)
 
 	// ⚡ REAL-TIME: Connect exchange aggregator to candle service for in-memory candles
 	candleSvc.SetExchangeAggregator(exchangeAgg)
@@ -177,8 +175,9 @@ func main() {
 	// Initialize gRPC server
 	grpcSrv := grpcServer.NewServer(cfg, candleSvc, markPriceSvc, symbolFetcher, redisClient, logger)
 
-	// Start HTTP server for health checks
-	go startHTTPServer(cfg, logger, candleSvc, symbolFetcher, exchangeAgg)
+	// Start HTTP server for health checks (will be updated after symbol manager creation)
+	// This is a placeholder - actual server start happens after symbol manager init
+	var symbolManager *symbols.SymbolManager
 
 	// Start gRPC server
 	grpcErrChan := make(chan error, 1)
@@ -195,62 +194,27 @@ func main() {
 		logger.WithError(err).Fatal("Failed to start exchange aggregator")
 	}
 
-	// Fetch symbols from backend trade service
-	logger.Info("Fetching symbols from backend trade service...")
-	allSymbols, err := symbolFetcher.GetSymbols(context.Background())
-	if err != nil {
-		logger.WithError(err).Warn("Failed to fetch symbols from backend, trying popular symbols...")
-		// Try popular symbols as backup
-		allSymbols, err = symbolFetcher.GetPopularSymbols(context.Background(), 100)
-		if err != nil {
-			logger.WithError(err).Error("Failed to fetch symbols - will retry in background")
-			allSymbols = symbols.DefaultSymbols // Use default symbols
-		}
+	// ⚡ DYNAMIC SYMBOL MANAGER: Automatically subscribe to symbols based on strategy
+	// Strategy can be: "all", "popular", or "top_N" (configurable via env vars)
+	logger.Info("🚀 Initializing dynamic symbol manager...")
+	symbolManager = symbols.NewSymbolManager(&cfg.Symbol, symbolFetcher, candleSvc, logger)
+
+	// Start the symbol manager - it will automatically fetch and subscribe to symbols
+	if err := symbolManager.Start(); err != nil {
+		logger.WithError(err).Warn("Symbol manager start had issues")
 	}
 
-	if len(allSymbols) == 0 {
-		logger.Warn("No symbols returned - using default symbols")
-		allSymbols = symbols.DefaultSymbols
-	}
+	subscribedCount := symbolManager.GetSubscribedCount()
+	logger.Infof("✅ Dynamic symbol manager started - %d symbols subscribed", subscribedCount)
 
-	logger.Infof("Loaded %d symbols available for on-demand subscription", len(allSymbols))
-
-	// ⚡ REAL-TIME FIX: Pre-warm top symbols for instant data availability
-	// Subscribe to popular symbols on startup so first users get instant data
-	// This eliminates the 5-15 second connection delay for common pairs
-	popularSymbols := []string{
-		"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-		"ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
-		"LINKUSDT", "UNIUSDT", "ATOMUSDT", "LTCUSDT", "ETCUSDT",
-		"TRXUSDT", "NEARUSDT", "XLMUSDT", "ALGOUSDT", "VETUSDT",
-	}
-
-	// Filter to only symbols that exist in our backend
-	symbolMap := make(map[string]bool)
-	for _, s := range allSymbols {
-		symbolMap[s] = true
-	}
-
-	prewarmCount := 0
-	for _, symbol := range popularSymbols {
-		if symbolMap[symbol] {
-			// Subscribe to 1m interval - all other intervals are derived from this
-			if err := candleSvc.SubscribeToInterval(context.Background(), symbol, "1m"); err != nil {
-				logger.WithError(err).Warnf("Failed to pre-warm %s", symbol)
-			} else {
-				prewarmCount++
-			}
-		}
-	}
-
-	logger.Infof("⚡ Pre-warmed %d popular symbols for instant real-time data", prewarmCount)
-	logger.Info("Exchange aggregator ready for on-demand subscriptions")
-
-	// Trigger connections now that we have subscriptions
-	if prewarmCount > 0 {
+	// Trigger exchange connections now that we have subscriptions
+	if subscribedCount > 0 {
 		exchangeAgg.TriggerReconnectAll()
-		logger.Info("✅ Triggered exchange connections for pre-warmed symbols")
+		logger.Info("✅ Triggered exchange connections for subscribed symbols")
 	}
+
+	// Start HTTP server now that symbol manager is initialized
+	go startHTTPServer(cfg, logger, candleSvc, symbolFetcher, symbolManager, exchangeAgg)
 
 	// ⚡ PRIORITY 2: Start background 24h stats calculator in candle service
 	candleSvc.Start24hStatsCalculator(context.Background())
@@ -359,64 +323,16 @@ func main() {
 	logger.Info("✅ Graceful shutdown complete - all services stopped")
 }
 
-func runMigrations(conn clickhouse.Conn, logger *logrus.Logger) error {
-	ctx := context.Background()
+// ⚡ NOTE: Migrations are now handled by docker-entrypoint-initdb.d
+// The migration SQL file is mounted in docker-compose.yml:
+//   - ./migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+// This allows using the optimized schema with:
+//   - Decimal64(8) for better precision
+//   - Smart TTL policies (90/180 days/2 years)
+//   - Materialized views for fast latest candle queries
+//   - DoubleDelta + Gorilla + ZSTD compression
 
-	// Create candles table
-	logger.Info("Creating candles table...")
-	query := `
-		CREATE TABLE IF NOT EXISTS candles (
-			symbol LowCardinality(String),
-			interval LowCardinality(String),
-			open_time DateTime64(3),
-			close_time DateTime64(3),
-			open Float64 CODEC(DoubleDelta, LZ4),
-			high Float64 CODEC(DoubleDelta, LZ4),
-			low Float64 CODEC(DoubleDelta, LZ4),
-			close Float64 CODEC(Gorilla, ZSTD(1)),
-			volume Float64 CODEC(Gorilla, ZSTD(1)),
-			quote_volume Float64 CODEC(Gorilla, ZSTD(1)),
-			trade_count UInt32,
-			taker_buy_base_volume Float64 CODEC(Gorilla, ZSTD(1)),
-			taker_buy_quote_volume Float64 CODEC(Gorilla, ZSTD(1)),
-			source LowCardinality(String) DEFAULT 'binance',
-			is_closed UInt8,
-			contract_type LowCardinality(String) DEFAULT 'spot',
-			created_at DateTime DEFAULT now(),
-			updated_at DateTime DEFAULT now(),
-			date Date MATERIALIZED toDate(open_time)
-		)
-		ENGINE = ReplacingMergeTree(updated_at)
-		PARTITION BY (contract_type, interval, toYYYYMM(date))
-		ORDER BY (contract_type, symbol, interval, open_time, source)
-		PRIMARY KEY (contract_type, symbol, interval, open_time)
-		TTL date + INTERVAL 2 YEAR
-		SETTINGS index_granularity = 8192
-	`
-	if err := conn.Exec(ctx, query); err != nil {
-		return fmt.Errorf("failed to create candles table: %w", err)
-	}
-	logger.Info("✓ Candles table created")
-
-	// Add indexes
-	logger.Info("Adding indexes...")
-	indexes := []string{
-		"ALTER TABLE candles ADD INDEX IF NOT EXISTS symbol_idx (symbol) TYPE bloom_filter() GRANULARITY 1",
-		"ALTER TABLE candles ADD INDEX IF NOT EXISTS source_idx (source) TYPE bloom_filter() GRANULARITY 1",
-		"ALTER TABLE candles ADD INDEX IF NOT EXISTS contract_type_idx (contract_type) TYPE bloom_filter() GRANULARITY 1",
-	}
-
-	for _, idx := range indexes {
-		if err := conn.Exec(ctx, idx); err != nil {
-			logger.Warnf("Failed to create index: %v", err)
-		}
-	}
-	logger.Info("✓ Indexes created")
-
-	return nil
-}
-
-func startHTTPServer(cfg *config.Config, logger *logrus.Logger, candleSvc *candleService.Service, symbolFetcher *symbols.SymbolFetcher, exchangeAgg *aggregator.ExchangeAggregator) {
+func startHTTPServer(cfg *config.Config, logger *logrus.Logger, candleSvc *candleService.Service, symbolFetcher *symbols.SymbolFetcher, symbolManager *symbols.SymbolManager, exchangeAgg *aggregator.ExchangeAggregator) {
 	mux := http.NewServeMux()
 
 	// ⚡ Static files for dashboard
@@ -442,7 +358,7 @@ func startHTTPServer(cfg *config.Config, logger *logrus.Logger, candleSvc *candl
 	mux.Handle("/metrics", promhttp.Handler())
 	logger.Info("✅ Prometheus metrics available at /metrics")
 
-	// Symbols endpoint - returns all supported trading symbols
+	// Symbols endpoint - returns all supported trading symbols (legacy)
 	mux.HandleFunc("/api/v1/binance/candles/symbols", func(w http.ResponseWriter, r *http.Request) {
 		allSymbols, _ := symbolFetcher.GetSymbols(context.Background())
 		w.Header().Set("Content-Type", "application/json")
@@ -453,6 +369,69 @@ func startHTTPServer(cfg *config.Config, logger *logrus.Logger, candleSvc *candl
 			"data": map[string]interface{}{
 				"count":   len(allSymbols),
 				"symbols": allSymbols,
+			},
+		})
+	})
+
+	// ⚡ NEW: Subscribed symbols endpoint - returns currently subscribed symbols
+	mux.HandleFunc("/api/v1/symbols/subscribed", func(w http.ResponseWriter, r *http.Request) {
+		subscribedSymbols := symbolManager.GetSubscribedSymbols()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Subscribed symbols retrieved successfully",
+			"data": map[string]interface{}{
+				"count":   len(subscribedSymbols),
+				"symbols": subscribedSymbols,
+			},
+		})
+	})
+
+	// ⚡ NEW: Force refresh symbols endpoint - triggers immediate symbol refresh
+	mux.HandleFunc("/api/v1/symbols/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		logger.Info("Manual symbol refresh triggered via API")
+		if err := symbolManager.ForceRefresh(); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to refresh symbols: %v", err),
+			})
+			return
+		}
+
+		subscribedCount := symbolManager.GetSubscribedCount()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Symbols refreshed successfully",
+			"data": map[string]interface{}{
+				"subscribed_count": subscribedCount,
+			},
+		})
+	})
+
+	// ⚡ NEW: Symbol configuration endpoint - returns current symbol strategy
+	mux.HandleFunc("/api/v1/symbols/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Symbol configuration retrieved successfully",
+			"data": map[string]interface{}{
+				"strategy":         cfg.Symbol.SubscriptionStrategy,
+				"max_symbols":      cfg.Symbol.MaxSymbols,
+				"min_volume":       cfg.Symbol.MinVolume,
+				"refresh_interval": cfg.Symbol.RefreshInterval.String(),
+				"auto_subscribe":   cfg.Symbol.AutoSubscribe,
+				"subscribed_count": symbolManager.GetSubscribedCount(),
 			},
 		})
 	})
